@@ -59,6 +59,10 @@ pip install dist/vllm-*.whl --no-deps
 5.5.0`、DTK/HIP/DCU 栈。登录节点或本地 macOS 上的 import/test 只能做工程检查，不能
 作为性能或兼容性结论。
 
+GitHub Actions 公共 runner 只运行 `Source Smoke`：检查仓库必要文件和 Python 源码语法。
+它不安装 PyTorch、不构建 wheel、不 import vLLM、不编译 DTK/HIP/DCU 扩展，也不能作为
+性能结论。正式比赛 wheel 必须仍在官方容器/算力节点里构建和验证。
+
 ## 评测与同步边界
 
 SCNet 当前已知 SSH 入口是无卡登录/传文件通道：

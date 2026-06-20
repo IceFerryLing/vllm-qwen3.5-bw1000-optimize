@@ -1,0 +1,73 @@
+name: Source Smoke
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-smoke:
+    name: Source-only smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Check repository shape
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          required_paths = [
+              "AGENTS.md",
+              "README.md",
+              "LICENSE",
+              "pyproject.toml",
+              "setup.py",
+              "vllm",
+          ]
+          missing = [path for path in required_paths if not Path(path).exists()]
+          if missing:
+              raise SystemExit(f"missing required paths: {missing}")
+
+          pyproject = Path("pyproject.toml").read_text()
+          if 'name = "vllm"' not in pyproject:
+              raise SystemExit("pyproject.toml does not declare the vllm project")
+
+          print("repository shape smoke passed")
+          PY
+
+      - name: Compile Python sources
+        run: |
+          set -euo pipefail
+          python -m compileall -q setup.py vllm
+
+      - name: Explain scope
+        run: |
+          cat <<'EOF'
+          This workflow is intentionally source-only. It does not install
+          PyTorch, build a wheel, import vLLM, compile DTK/HIP/DCU extensions,
+          or validate performance. Competition wheels must be built and tested
+          inside the official container on SCNet compute nodes.
+          EOF
