@@ -15,9 +15,6 @@ branch:   v0.18.1
 commit:   fa718036b [Arch] Support bmz and nmz
 ```
 
-本仓库只用于 vLLM 源码优化和 wheel 构建。比赛资料、远端账号说明、模型下载记录、
-benchmark 汇总和提交文档放在外层 `qwen-workspace` 仓库。
-
 ## 分支语义
 
 - `v0.18.1`：SourceFind/OpenDAS 基线分支，跟踪 `upstream/v0.18.1`。不要直接在此分支
