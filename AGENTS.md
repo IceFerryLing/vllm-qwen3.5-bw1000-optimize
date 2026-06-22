@@ -69,9 +69,9 @@ GitHub Actions 公共 runner 只运行 `Source Smoke`：检查仓库必要文件
 队伍家目录 `<TEAM_HOME> baseline 前先查既有材料，避免重复下载、重复
 复制、构建或跑长任务：
 
-- 模型：`<TEAM_HOME> 已有完整副本；新有卡容器首次跑 baseline
-  前复制到 `/root/Qwen3.5-27B` 加速读取，服务和脚本使用 `/root/Qwen3.5-27B`。同一容器复制
-  完成后不要再复制，也不要网络下载。
+- 模型：`<TEAM_HOME> 已有完整副本；服务和脚本直接使用这个
+  home 路径。禁止把模型权重复制、克隆或流式写入容器 `/root`，这会给共享存储和容器层带来
+  压力；也不要网络下载。
 - wheel：优先从 `<TEAM_HOME> 或源码 `dist/` 安装已有 wheel，不要重编译。
 - baseline：统一入口是 `<TEAM_HOME>
   吞吐只引用 `baseline_index/valid_throughput/*/result.json`，不要直接从 `latest/test/` 取数；
@@ -158,7 +158,7 @@ AITER unified attention 是显式实验路径，不要默认偷偷打开。已�
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1
 export VLLM_ROCM_USE_AITER_MHA=1
-vllm serve /root/Qwen3.5-27B ... --block-size 16
+vllm serve <TEAM_HOME> ... --block-size 16
 ```
 
 原因：Qwen3.5/mamba 对齐会把 attention page size 设为 `784`；AITER unified 默认覆盖到
