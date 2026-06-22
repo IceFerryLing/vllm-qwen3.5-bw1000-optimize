@@ -65,11 +65,68 @@ GitHub Actions 公共 runner 只运行 `Source Smoke`：检查仓库必要文件
 比赛算力供给情况：约 `600` 个队伍排队共享约 `100` 张加速卡；每个队伍单次使用额度为
 `2` 卡时。
 
+有卡实例时间短。`/public/share` 是公开目录，不再使用；模型、wheel、baseline 记录全部放在
+队伍家目录 `<TEAM_HOME> baseline 前先查既有材料，避免重复下载、重复
+复制、构建或跑长任务：
+
+- 模型：`<TEAM_HOME> 已有完整副本；新有卡容器首次跑 baseline
+  前复制到 `/root/Qwen3.5-27B` 加速读取，服务和脚本使用 `/root/Qwen3.5-27B`。同一容器复制
+  完成后不要再复制，也不要网络下载。
+- wheel：优先从 `<TEAM_HOME> 或源码 `dist/` 安装已有 wheel，不要重编译。
+- baseline：统一入口是 `<TEAM_HOME>
+  吞吐只引用 `baseline_index/valid_throughput/*/result.json`，不要直接从 `latest/test/` 取数；
+  其中有早期代理失败结果。`baseline_results/` 是早期 root-owned 空目录，不要使用。
+- benchmark 客户端连本机 vLLM 前必须设置 `NO_PROXY/no_proxy=127.0.0.1,localhost` 并清掉
+  `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，否则 localhost 请求可能走 squid 代理得到假
+  `503` 结果。
+- 新 baseline 的结论、日志摘要、关键命令和结果文件写到
+  `<TEAM_HOME>
+  `<TEAM_HOME> 和
+  `baseline_index/valid_throughput/`。
+
 SCNet 当前已知 SSH 入口是无卡登录/传文件通道：
 
 ```text
 ssh <TEMPORARY_LOGIN_COMMAND> -p <COMPETITION_LOGIN_PORT> c118-team@<COMPETITION_LOGIN_HOST>
 ```
+
+该 E-Shell host key 可能随实例变化；登录时始终绕过本地 `known_hosts` 校验，避免动态入口
+被旧记录卡住：
+
+```bash
+ssh <TEMPORARY_LOGIN_COMMAND> -p <COMPETITION_LOGIN_PORT> \
+  -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+  c118-team@<COMPETITION_LOGIN_HOST>
+```
+
+部分网页容器实例背后由 Slurm/Gridview 调度系统启动。调度入口可以选择个人用户名，也可以
+选择队伍用户名；队伍用户名通常是一次性的，可以按需记录，个人用户名不要写入仓库文档、
+脚本或提交信息。入口示例：
+
+```text
+<TEMPORARY_LOGIN_COMMAND>
+```
+
+定位实例对应作业和节点：
+
+```bash
+/opt/gridview/slurm/bin/squeue -u "$USER" -o "%.18i %.9P %.40j %.8u %.2t %.10M %.6D %R"
+/opt/gridview/slurm/bin/scontrol show job <JOBID>
+```
+
+SCNet 官方文档说明：E-Shell 默认进入登录节点；`squeue` 中状态 `R` 表示节点已运行，进入
+计算节点可直接 `ssh <节点名>`，容器/SSH 页面给出 id 或别名时优先 `ssh <id>`。轮询只用于
+等待实例/容器从 pending 进入 running，不负责后续登录和执行。`scancel <JOBID>` 用于释放
+作业。`squeue` 的 `NODELIST`、`scontrol show job` 的 `NodeList` / `BatchHost` 是计算节点。
+作业目录通常位于：
+
+```text
+<TEAM_HOME>
+```
+
+作业目录中的 `_dockerlist_<JOBID>` 记录容器名、容器 ID、DCU 编号、挂载和容器 IP。
+`ai_docker exec` 只作为直接 SSH 不可用时的兜底方式，并且它的 wrapper 会拆复杂引号；复杂
+命令先写成脚本文件，再执行 `bash <script>`。
 
 该通道只用于传文件、同步源码、保存 wheel、下载模型和汇总日志。不要在该通道上跑：
 
@@ -89,6 +146,26 @@ run_accuracy.sh
 
 吞吐关注 output tokens/s、TTFT P99、TPOT P99。精度关注 LongBench/RULER 相关任务输出
 和后处理结果。调试集结果只作为自身 baseline，最终分数以评测机和官方 baseline 为准。
+
+当前比赛卡按 BW1000 / `gfx936` 处理。新的 HIP/DUMMA/`_rocm_C` probe、编译命令和
+CMake 目标默认使用 `--offload-arch=gfx936`。
+DUMMA probe 若用 DCC 编译，链接时显式加
+`-L/opt/dtk-26.04-DCC2602-0317/dcc/lib/clang/17.0.0/lib/linux`。
+
+AITER unified attention 是显式实验路径，不要默认偷偷打开。已知 Qwen3.5 路径要同时使用：
+
+```bash
+export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1
+export VLLM_ROCM_USE_AITER_MHA=1
+vllm serve /root/Qwen3.5-27B ... --block-size 16
+```
+
+原因：Qwen3.5/mamba 对齐会把 attention page size 设为 `784`；AITER unified 默认覆盖到
+`64` 会触发 page-size 不整除，`--block-size 16` 可满足 `784 % 16 == 0`。这可能引入
+KV/page 管理开销或 tile 不理想，必须用 accuracy、throughput 和 profiler 记录说明收益与
+风险。当前 4-8K full50 记录显示 AITER unified 相对默认 Triton attention 主要改善 TTFT
+P99，TPOT 基本持平；它是 backend enablement 证据，不是最终核心优化结论。
 
 ## 合规红线
 
