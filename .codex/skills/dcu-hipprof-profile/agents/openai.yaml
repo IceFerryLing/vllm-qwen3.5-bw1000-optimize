@@ -1,0 +1,4 @@
+interface:
+  display_name: "DCU hipprof Profile"
+  short_description: "Profile vLLM on DCU with hipprof"
+  default_prompt: "Use $dcu-hipprof-profile to plan and summarize a short vLLM hipprof run on a DCU node."

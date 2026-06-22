@@ -70,8 +70,10 @@ GitHub Actions 公共 runner 只运行 `Source Smoke`：检查仓库必要文件
 复制、构建或跑长任务：
 
 - 模型：`<TEAM_HOME> 已有完整副本；服务和脚本直接使用这个
-  home 路径。禁止把模型权重复制、克隆或流式写入容器 `/root`，这会给共享存储和容器层带来
-  压力；也不要网络下载。
+  home 路径，也不要网络下载。
+- 容器 `/root` 不作为持久工作区。不要把模型权重、wheel、源码构建缓存或大日志复制到
+  `/root`；构建时把 `TMPDIR`/`TMP`/`TEMP` 指到家目录。若已占用 `/root`，任务结束后清理或
+  直接释放容器。
 - wheel：优先从 `<TEAM_HOME> 或源码 `dist/` 安装已有 wheel，不要重编译。
 - baseline：统一入口是 `<TEAM_HOME>
   吞吐只引用 `baseline_index/valid_throughput/*/result.json`，不要直接从 `latest/test/` 取数；
@@ -83,6 +85,8 @@ GitHub Actions 公共 runner 只运行 `Source Smoke`：检查仓库必要文件
   `<TEAM_HOME>
   `<TEAM_HOME> 和
   `baseline_index/valid_throughput/`。
+- 项目专用 skills 放在 `.codex/skills/`。从新 session 上卡跑 clean baseline 时使用
+  `$scnet-vllm-baseline`；不要把完整执行流程继续堆进本文件。
 
 SCNet 当前已知 SSH 入口是无卡登录/传文件通道：
 

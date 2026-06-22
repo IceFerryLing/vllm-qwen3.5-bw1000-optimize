@@ -1,0 +1,4 @@
+interface:
+  display_name: "SCNet vLLM Baseline"
+  short_description: "Run SCNet Qwen/vLLM baselines reliably"
+  default_prompt: "Use $scnet-vllm-baseline to run or validate a clean SCNet vLLM baseline."

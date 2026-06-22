@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Diff Compliance"
+  short_description: "Review competition diffs for compliance"
+  default_prompt: "Use $vllm-diff-compliance to review my git diff for competition compliance risks."
