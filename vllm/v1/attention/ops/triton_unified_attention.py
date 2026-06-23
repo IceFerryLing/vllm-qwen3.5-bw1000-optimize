@@ -7,6 +7,8 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -17,6 +19,98 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+_profile_logged_configs: set[tuple[object, ...]] = set()
+
+
+def _get_block_m(num_queries_per_kv: int) -> int:
+    block_m_override = os.environ.get("QWEN_UA_BLOCK_M")
+    if not block_m_override:
+        return (
+            16
+            if num_queries_per_kv <= 16
+            else triton.next_power_of_2(num_queries_per_kv)
+        )
+
+    block_m = int(block_m_override)
+    if block_m < num_queries_per_kv:
+        raise ValueError(
+            "QWEN_UA_BLOCK_M must be >= "
+            f"num_queries_per_kv={num_queries_per_kv}, got {block_m}"
+        )
+    return block_m
+
+
+def _get_probe_stage() -> int:
+    probe_stage = os.environ.get("QWEN_UA_PROBE_STAGE", "full").lower()
+    if probe_stage in ("", "full", "0"):
+        return 0
+    if probe_stage in ("qk", "1"):
+        return 1
+    if probe_stage in ("softmax", "qk_softmax", "2"):
+        return 2
+    raise ValueError(
+        "QWEN_UA_PROBE_STAGE must be one of full, qk, softmax; "
+        f"got {probe_stage!r}"
+    )
+
+
+def _log_profile_config(
+    kernel: str,
+    probe_stage: int,
+    block_m: int,
+    block_q: int,
+    tile_size: int,
+    head_size: int,
+    block_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_seqs: int,
+    total_num_q_blocks: int,
+) -> None:
+    if os.environ.get("QWEN_UA_PROFILE_LOG", "0") != "1":
+        return
+    config = (
+        kernel,
+        probe_stage,
+        block_m,
+        block_q,
+        tile_size,
+        head_size,
+        block_size,
+        num_query_heads,
+        num_kv_heads,
+        num_queries_per_kv,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_seqs,
+        total_num_q_blocks,
+    )
+    if config in _profile_logged_configs:
+        return
+    _profile_logged_configs.add(config)
+    logger.info(
+        "QWEN_UA_PROFILE backend=TRITON_ATTN kernel=%s probe_stage=%s "
+        "BLOCK_M=%s BLOCK_Q=%s TILE_SIZE=%s head_size=%s block_size=%s "
+        "num_query_heads=%s num_kv_heads=%s num_queries_per_kv=%s "
+        "max_seqlen_q=%s max_seqlen_k=%s num_seqs=%s total_q_blocks=%s",
+        kernel,
+        probe_stage,
+        block_m,
+        block_q,
+        tile_size,
+        head_size,
+        block_size,
+        num_query_heads,
+        num_kv_heads,
+        num_queries_per_kv,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_seqs,
+        total_num_q_blocks,
+    )
 
 
 @triton.jit
@@ -104,6 +198,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    PROBE_STAGE: tl.constexpr,  # 0=full, 1=QK, 2=QK+softmax
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -164,6 +259,7 @@ def kernel_unified_attention_2d(
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    probe_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -351,6 +447,10 @@ def kernel_unified_attention_2d(
             )
             S += qq_bias
 
+        if PROBE_STAGE == 1:
+            probe_acc += tl.sum(tl.where(S > float("-inf"), S, 0.0), axis=1)
+            continue
+
         # compute running maximum
         # m_j : (BLOCK_M,)
         m_j = tl.maximum(M, tl.max(S, axis=1))
@@ -375,6 +475,10 @@ def kernel_unified_attention_2d(
         L = L * alpha + l_j
         M = m_j
 
+        if PROBE_STAGE == 2:
+            probe_acc += L
+            continue
+
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
             V = tl.where(
@@ -384,23 +488,30 @@ def kernel_unified_attention_2d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
-    # epilogue
-    acc = acc / L[:, None]
-    if USE_FP8:
-        acc = acc * tl.load(out_scale)
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
-
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
         + offs_d[None, :]
     )
 
-    tl.store(
-        output_ptr + output_offset,
-        acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-    )
+    if PROBE_STAGE != 0:
+        tl.store(
+            output_ptr + output_offset,
+            probe_acc[:, None],
+            mask=(offs_d[None, :] == 0) & query_mask_0[:, None] & query_mask_1[:, None],
+        )
+    else:
+        # epilogue
+        acc = acc / L[:, None]
+        if USE_FP8:
+            acc = acc * tl.load(out_scale)
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        tl.store(
+            output_ptr + output_offset,
+            acc,
+            mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        )
 
 
 @triton.jit
@@ -939,10 +1050,9 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
+    BLOCK_M = _get_block_m(num_queries_per_kv)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
+    probe_stage = _get_probe_stage()
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -986,6 +1096,22 @@ def unified_attention(
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     ):
+        _log_profile_config(
+            "unified_attention_2d",
+            probe_stage,
+            BLOCK_M,
+            BLOCK_Q,
+            TILE_SIZE_PREFILL,
+            head_size,
+            block_size,
+            num_query_heads,
+            num_kv_heads,
+            num_queries_per_kv,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_seqs,
+            total_num_q_blocks,
+        )
         kernel_unified_attention_2d[
             (
                 total_num_q_blocks,
@@ -1039,9 +1165,26 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
+            PROBE_STAGE=probe_stage,
             USE_FP8=output_scale is not None,
         )
     else:
+        _log_profile_config(
+            "unified_attention_3d",
+            0,
+            BLOCK_M,
+            BLOCK_Q,
+            TILE_SIZE_DECODE,
+            head_size,
+            block_size,
+            num_query_heads,
+            num_kv_heads,
+            num_queries_per_kv,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_seqs,
+            total_num_q_blocks,
+        )
         kernel_unified_attention_3d[
             (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         ](

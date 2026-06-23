@@ -5,10 +5,16 @@
 - AITER 的 `unified_attention` 实现层面做了跨 page/block 的 online softmax。
 - 它不是把每个 page 当独立 chunk 分别 softmax 后直接拼接或相加。
 - 但该路径仍必须用输出一致性和 profile 双验证；profile 只能证明快，不能证明语义正确。
-- 对 Qwen3.5 来说，AITER 更重要的近期路径不是 full attention，而是 GDN fast path。
-  其中 decode fast path 证据最强：上游已有 Qwen3-Next AITER GDN decode 接入，后续又补了
-  Qwen3.5 flat layout 支持。GDN prefill 目前只能算研究方向，不能只凭相关 issue 或
-  `#42880` 认定可直接优化。
+- 对 Qwen3.5 来说，AITER 的两条近期路径在本地实测下都**没有明显优势**（详见下文各节）：
+  - GDN **decode** fast path：本地 decode GDN 已被 FLA packed recurrent 优化到占官方
+    16-32K 负载的 **0.28%**，AITER decode 要砍的 launch overhead 已被 FLA packed 砍过，
+    边际收益 << 上游宣称的 5-8%（那是相对 Qwen3-Next generic 路径的数）。
+  - GDN **prefill**：是真热点（prefill-heavy 单请求下 GDN chunk 系列合计 ~44%），但 AITER
+    prefill 上游只是研究方向（issue #2354），无可直接回迁的实现证据。
+  - AITER **GEMM**：官方负载 GEMM 已是 autotune 的 rocBLAS/Tensile（BF16 dense，非
+    FP8/MoE），AITER GEMM 无结构性优势。
+- 因此 AITER 方向当前**不作为投入优先项**；若要动 GDN，应转向 prefill 拆解，不是 decode。
+
 
 ## 代码证据
 
@@ -181,10 +187,42 @@ backend 适配，不是模型特化。
 
 ## Qwen3.5 GDN fast path
 
-这是当前 AITER 方向里最值得继续跟的路径。它不是 full attention，而是 Qwen3.5 的
-Gated DeltaNet / linear attention 路径。近期优先级应是 decode fast path，而不是 prefill：
-decode 的上游实现、layout bug 和 flat-layout 修复证据链完整；prefill 需要先 profile
-证明 `ChunkGatedDeltaRule` / `chunk_fwd_kernel_o` 等确实是当前 16K-32K 的主瓶颈。
+本地实测修正了这条线的优先级：**AITER GDN decode fast path 在当前负载下没有明显优势**，
+真热点在 prefill 不在 decode。
+
+实测证据（`misc/profile/profile_runs/hipprof_stats_bm64_16_32k_official1_20260623_185033`，
+官方 16-32K 多 prompt serving，BLOCK_M=64）：
+
+```text
+decode GDN: fused_recurrent_gated_delta_rule_packed_decode_kernel
+            calls=4224 total=176ms avg=41.8µs pct=0.28%
+prefill GDN (chunk 系列合计):
+  chunk_fwd_kernel_o                        6.6%
+  chunk_scaled_dot_kkt_fwd_kernel           2.2%
+  chunk_gated_delta_rule_fwd                1.9%
+  merge_16x16_to_64x64_inverse              1.7%
+  recompute_w_u_fwd                         1.5%
+  (prefill-heavy 单请求下 GDN 合计可达 ~44%)
+```
+
+三层理由判定 AITER GDN decode 无明显优势：
+
+```text
+1. decode GDN 本身只占 0.28%（176ms/63.1s）。就算 AITER 优化到 0，端到端也只省 0.28%。
+   上游宣称的 5-8% 是相对 Qwen3-Next TPOT 的数，那个基数里 GDN decode 占比远高于 0.28%。
+2. 当前 decode 已走 FLA packed recurrent（fused_recurrent_gated_delta_rule_packed_decode_kernel，
+   单 launch fused，grid=(NV, B*HV)），AITER 要砍的“每层 20-26us launch overhead”已被
+   FLA packed 砍过。AITER 相对 FLA packed 的边际收益 << AITER 相对 generic 的收益。
+3. GDN 真热点在 prefill（prefill-heavy 44%），AITER GDN Decode 不碰 prefill。
+```
+
+接入成本也高：本地无 AITER GDN 接入（grep 零命中），要从上游 `gdn_linear_attn.py` /
+`qwen_gdn_linear_attn.py` 最小回迁，处理 Qwen3.5 flat-layout（`#42880` guard）、`#3251`
+layout 参数、sinks/output_scale 兼容性 gate。**高接入成本换 <1% 收益，不投入。**
+
+若一定要做 GDN 方向，应转向 **prefill**：先用 profile 拆 `ChunkGatedDeltaRule` 内部
+（`chunk_fwd_kernel_o` / `chunk_scaled_dot_kkt_fwd` / `chunk_gated_delta_rule` 哪个是主成本），
+再评估是否有数学等价的 tile/fusion 优化空间。AITER prefill 上游只是研究方向，不可直接回迁。
 
 本地源码现状：
 
