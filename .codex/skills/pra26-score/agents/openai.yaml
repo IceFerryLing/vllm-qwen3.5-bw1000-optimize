@@ -1,0 +1,3 @@
+display_name: PRA26 Score
+short_description: Calculate preliminary score from 4-8K, 8-16K, and 16-32K throughput changes.
+default_prompt: Calculate the PRA26 preliminary score for these three throughput improvements.
