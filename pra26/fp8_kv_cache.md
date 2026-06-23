@@ -74,7 +74,7 @@ if "fp8" in kv_cache_dtype:
 
 这些 `tl.dot` 是 attention kernel 内部的 QK/PV 计算，不是 vLLM Linear layer 的 GEMM dispatch，也不是 `_aiter_ops.gemm_a8w8` 等 AITER GEMM wrapper。
 
-## DUMMA 方向
+## FP8 load/dequant 方向
 
 这反而提示了一个更值得披露和研究的点：FP8 KV Cache 暴露了 attention kernel 内部的 FP8 KV load/dequant 热点。如果 Triton 当前只是普通：
 
@@ -82,12 +82,18 @@ if "fp8" in kv_cache_dtype:
 tl.load(fp8) -> fp32 scale/dequant -> cast -> tl.dot
 ```
 
-而没有充分利用 DCU/DUMMA 的 FP8 load 或相关矩阵数据通路，那么可以尝试用 DUMMA 做更底层的 FP8 KV load/dequant 探针。
+那么可优化的是 load/dequant 这段数据通路（FP8 load/convert 指令是否被充分利用），不是
+MFMA 计算能力——Triton 的 `tl.dot` 已经发射 MFMA，与 DUMMA 共享同一硬件单元，不存在
+"Triton 不会用矩阵核心"的问题。
+
+本卡约束：DUMMA 的 FP8 MMA 仅 gfx938，本卡 gfx936 不可用。所以 FP8 GEMM 对照应走
+hipBLASLt（有完整 FP8/MXFP8 scaling 接口），FP8 load/convert 探测应查 DTK 的 `fp8.h`
+device header 或 LLVM intrinsic（如 `__builtin_amdgcn_cvt_*_fp8`），而不是 DUMMA。
 
 优先级不是重写整个 attention，而是先回答三个问题：
 
 1. 当前 Triton FP8 KV kernel 生成的 IR/ISA 是否已经利用专门的 FP8 load/convert 指令。
-2. DUMMA FP8 load/dequant microkernel 是否比 Triton 当前路径更快。
+2. hipBLASLt FP8 GEMM 或独立 FP8 load/convert microkernel 是否比 Triton 当前路径更快。
 3. FP8 KV Cache 在 16-32K 上是否能带来真实吞吐/TPOT/TTFT 收益且精度可接受。
 
 如果 1 和 2 证明存在低层空间，再考虑接入 vLLM。
@@ -151,7 +157,7 @@ bash ./run_accuracy.sh aggregation_keyword_aggregation
 
 ## 可能的接入方式
 
-如果 DUMMA probe 证明 FP8 load/dequant 有明显收益，接入方式按风险从低到高：
+如果 FP8 load/convert microbench 证明有明显收益，接入方式按风险从低到高：
 
 1. 自定义 HIP op 做 gather/dequant 到临时 buffer，再复用现有 Triton attention。
    - 工程风险低。
