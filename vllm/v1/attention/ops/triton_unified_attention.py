@@ -17,6 +17,20 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
+TRITON_UNIFIED_ATTN_BLOCK_M = 16
+
+
+def _get_block_m(num_queries_per_kv: int) -> int:
+    if num_queries_per_kv <= 16:
+        block_m = int(TRITON_UNIFIED_ATTN_BLOCK_M)
+        if block_m < num_queries_per_kv:
+            raise ValueError(
+                "TRITON_UNIFIED_ATTN_BLOCK_M must be >= "
+                f"num_queries_per_kv={num_queries_per_kv}, got {block_m}"
+            )
+        return block_m
+
+    return triton.next_power_of_2(num_queries_per_kv)
 
 
 @triton.jit
@@ -939,9 +953,7 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
+    BLOCK_M = _get_block_m(num_queries_per_kv)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Ideally we would launch with kernel with:

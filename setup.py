@@ -18,6 +18,7 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py as build_py_orig
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -93,6 +94,44 @@ class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
+
+
+class submit_build_py(build_py_orig):
+    def run(self):
+        super().run()
+        self.patch_triton_unified_attention_block_m()
+
+    def patch_triton_unified_attention_block_m(self):
+        block_m = os.environ.get("TRITON_UNIFIED_ATTN_BLOCK_M", "16")
+        if not block_m.isdigit() or int(block_m) <= 0:
+            raise RuntimeError(
+                "TRITON_UNIFIED_ATTN_BLOCK_M must be a positive integer, "
+                f"got {block_m!r}"
+            )
+
+        path = (
+            Path(self.build_lib)
+            / "vllm"
+            / "v1"
+            / "attention"
+            / "ops"
+            / "triton_unified_attention.py"
+        )
+        text = path.read_text(encoding="utf-8")
+        new = f"TRITON_UNIFIED_ATTN_BLOCK_M = {int(block_m)}"
+        text, count = re.subn(
+            r"^TRITON_UNIFIED_ATTN_BLOCK_M = \d+$",
+            new,
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise RuntimeError(
+                "Could not find TRITON_UNIFIED_ATTN_BLOCK_M assignment "
+                f"in {path}"
+            )
+        path.write_text(text, encoding="utf-8")
 
 
 class cmake_build_ext(build_ext):
@@ -1056,14 +1095,12 @@ if envs.VLLM_USE_PRECOMPILED:
 if _no_device():
     ext_modules = []
 
-if not ext_modules:
-    cmdclass = {}
-else:
-    cmdclass = {
-        "build_ext": precompiled_build_ext
-        if envs.VLLM_USE_PRECOMPILED
-        else cmake_build_ext,
-    }
+cmdclass = {"build_py": submit_build_py}
+
+if ext_modules:
+    cmdclass["build_ext"] = (
+        precompiled_build_ext if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
+    )
 
 setup(
     # static metadata should rather go in pyproject.toml
