@@ -1682,8 +1682,8 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
+        # Start copying the block table first. Padded rows, if any, are staged
+        # and copied later when attention metadata knows the padded size.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get request indices.
@@ -1783,18 +1783,13 @@ class GPUModelRunner(
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self.query_start_loc.copy_to_gpu(num_reqs + 1)
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
-        # Fill unused with 0 for full cuda graph mode.
-        self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
+        self.seq_lens.copy_to_gpu(num_reqs)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -1865,8 +1860,7 @@ class GPUModelRunner(
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
-            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+            self.num_decode_draft_tokens.copy_to_gpu(num_reqs)
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -1897,6 +1891,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        block_tables_committed: bool = True,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1927,8 +1922,29 @@ class GPUModelRunner(
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            self.num_accepted_tokens.copy_to_gpu(num_reqs)
+            if num_reqs < num_reqs_padded:
+                self.num_accepted_tokens.np[num_reqs:num_reqs_padded].fill(1)
+                self.num_accepted_tokens.copy_slice_to_gpu(num_reqs, num_reqs_padded)
+
+        if num_reqs < num_reqs_padded:
+            # Pad query_start_loc to be non-decreasing, as kernels like
+            # FlashAttention require that. Only the visible padded range can be
+            # consumed by attention metadata.
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
+                self.query_start_loc.np[num_reqs]
+            )
+            self.query_start_loc.copy_slice_to_gpu(num_reqs + 1, num_reqs_padded + 1)
+
+            # Fill unused seq_lens with 0 for full cuda graph mode.
+            self.seq_lens.np[num_reqs:num_reqs_padded].fill(0)
+            self.seq_lens.copy_slice_to_gpu(num_reqs, num_reqs_padded)
+
+            if use_spec_decode:
+                self.num_decode_draft_tokens.np[num_reqs:num_reqs_padded].fill(-1)
+                self.num_decode_draft_tokens.copy_slice_to_gpu(
+                    num_reqs, num_reqs_padded
+                )
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -1943,11 +1959,15 @@ class GPUModelRunner(
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
+                if block_tables_committed:
+                    blk_table.commit_block_table_padding(num_reqs_padded, num_reqs)
+                else:
+                    blk_table.commit_block_table(num_reqs_padded, num_reqs)
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
-            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-            blk_table_tensor[num_reqs:num_reqs_padded].fill_(-1)
+            # graph mode. This is handled on the CPU side before H2D copy in
+            # commit_block_table() to avoid a separate GPU FillFunctor kernel.
             return blk_table_tensor
 
         assert slot_mappings is not None
@@ -1982,8 +2002,10 @@ class GPUModelRunner(
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
             )
-            self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
-            self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+            self.dcp_local_seq_lens.copy_to_gpu(num_reqs)
+            if num_reqs < num_reqs_padded:
+                self.dcp_local_seq_lens.cpu[num_reqs:num_reqs_padded].fill_(0)
+                self.dcp_local_seq_lens.copy_slice_to_gpu(num_reqs, num_reqs_padded)
 
             cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
@@ -3465,6 +3487,7 @@ class GPUModelRunner(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        slot_mappings_committed: bool = True,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -3503,11 +3526,19 @@ class GPUModelRunner(
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
+                if slot_mappings_committed:
+                    blk_table.commit_slot_mapping_padding(
+                        num_tokens_padded, num_tokens_unpadded
+                    )
+                else:
+                    blk_table.commit_slot_mapping(
+                        num_tokens_padded, num_tokens_unpadded
+                    )
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
-            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+            # graph mode. This is handled on the CPU side before H2D copy in
+            # commit_slot_mapping() to avoid a separate GPU FillFunctor kernel.
 
             return slot_mapping
 
@@ -5099,6 +5130,7 @@ class GPUModelRunner(
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
+            slot_mappings_committed=False,
         )
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
@@ -5119,12 +5151,22 @@ class GPUModelRunner(
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
                 self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
-                self.seq_lens.copy_to_gpu()
+                self.seq_lens.copy_to_gpu(num_reqs)
+                if num_reqs < num_reqs_padded:
+                    self.seq_lens.np[num_reqs:num_reqs_padded] = 0
+                    self.seq_lens.copy_slice_to_gpu(num_reqs, num_reqs_padded)
 
                 cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+                self.query_start_loc.np[0] = 0
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.copy_to_gpu()
+                self.query_start_loc.copy_to_gpu(num_reqs + 1)
+                if num_reqs < num_reqs_padded:
+                    self.query_start_loc.np[
+                        num_reqs + 1 : num_reqs_padded + 1
+                    ] = cum_num_tokens[-1]
+                    self.query_start_loc.copy_slice_to_gpu(
+                        num_reqs + 1, num_reqs_padded + 1
+                    )
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
@@ -5136,6 +5178,7 @@ class GPUModelRunner(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    block_tables_committed=False,
                 )
 
         with self.maybe_dummy_run_with_lora(

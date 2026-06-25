@@ -71,9 +71,9 @@ class BlockTables:
         ]
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
-        self.slot_mappings = torch.zeros(
-            self.num_kv_cache_groups,
-            self.max_num_batched_tokens,
+        self.slot_mappings = torch.full(
+            (self.num_kv_cache_groups, self.max_num_batched_tokens),
+            PAD_SLOT_ID,
             dtype=torch.int64,
             device=self.device,
         )
@@ -158,14 +158,11 @@ class BlockTables:
         return self.slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
-        # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.
-        # This is because the padding logic is complex and kernels may access beyond
-        # the requested range.
-        self.slot_mappings.fill_(PAD_SLOT_ID)
         # NOTE(woosuk): The output may be used for CUDA graph capture.
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
-        # rather than allocating a new tensor.
+        # rather than allocating a new tensor. The tensor is initialized with
+        # PAD_SLOT_ID, and runtime slot-mapping kernels maintain padded slots.
         return self.slot_mappings[:, :num_tokens]
 
 

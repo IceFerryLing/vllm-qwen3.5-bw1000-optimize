@@ -190,11 +190,35 @@ class BlockTable:
                 out=self.slot_mapping.np[: req_indices.shape[0]],
             )
 
-    def commit_block_table(self, num_reqs: int) -> None:
+    def commit_block_table(
+        self, num_reqs: int, num_valid_reqs: int | None = None
+    ) -> None:
+        if num_valid_reqs is not None and num_valid_reqs < num_reqs:
+            self.block_table.np[num_valid_reqs:num_reqs, :] = -1
         self.block_table.copy_to_gpu(num_reqs)
 
-    def commit_slot_mapping(self, num_tokens: int) -> None:
+    def commit_block_table_padding(
+        self, num_reqs_padded: int, num_valid_reqs: int
+    ) -> None:
+        if num_valid_reqs >= num_reqs_padded:
+            return
+        self.block_table.np[num_valid_reqs:num_reqs_padded, :] = -1
+        self.block_table.copy_slice_to_gpu(num_valid_reqs, num_reqs_padded)
+
+    def commit_slot_mapping(
+        self, num_tokens: int, num_valid_tokens: int | None = None
+    ) -> None:
+        if num_valid_tokens is not None and num_valid_tokens < num_tokens:
+            self.slot_mapping.np[num_valid_tokens:num_tokens] = -1
         self.slot_mapping.copy_to_gpu(num_tokens)
+
+    def commit_slot_mapping_padding(
+        self, num_tokens_padded: int, num_valid_tokens: int
+    ) -> None:
+        if num_valid_tokens >= num_tokens_padded:
+            return
+        self.slot_mapping.np[num_valid_tokens:num_tokens_padded] = -1
+        self.slot_mapping.copy_slice_to_gpu(num_valid_tokens, num_tokens_padded)
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
@@ -325,13 +349,29 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(req_indices, positions)
 
-    def commit_block_table(self, num_reqs: int) -> None:
+    def commit_block_table(
+        self, num_reqs: int, num_valid_reqs: int | None = None
+    ) -> None:
         for block_table in self.block_tables:
-            block_table.commit_block_table(num_reqs)
+            block_table.commit_block_table(num_reqs, num_valid_reqs)
 
-    def commit_slot_mapping(self, num_tokens: int) -> None:
+    def commit_block_table_padding(
+        self, num_reqs_padded: int, num_valid_reqs: int
+    ) -> None:
         for block_table in self.block_tables:
-            block_table.commit_slot_mapping(num_tokens)
+            block_table.commit_block_table_padding(num_reqs_padded, num_valid_reqs)
+
+    def commit_slot_mapping(
+        self, num_tokens: int, num_valid_tokens: int | None = None
+    ) -> None:
+        for block_table in self.block_tables:
+            block_table.commit_slot_mapping(num_tokens, num_valid_tokens)
+
+    def commit_slot_mapping_padding(
+        self, num_tokens_padded: int, num_valid_tokens: int
+    ) -> None:
+        for block_table in self.block_tables:
+            block_table.commit_slot_mapping_padding(num_tokens_padded, num_valid_tokens)
 
     def clear(self) -> None:
         for block_table in self.block_tables:
