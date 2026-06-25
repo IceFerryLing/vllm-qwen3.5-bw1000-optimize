@@ -219,38 +219,6 @@ def _construct_cached_request_state(req_id_suffix: int):
     )
 
 
-def test_block_table_slot_mapping_padding_staged_tail_copy():
-    block_table = BlockTable(
-        block_size=16,
-        max_num_reqs=4,
-        max_num_blocks_per_req=4,
-        max_num_batched_tokens=8,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        kernel_block_size=16,
-        cp_kv_cache_interleave_size=1,
-    )
-
-    block_table.slot_mapping.np[:] = 77
-    block_table.slot_mapping.gpu[:] = 99
-    block_table.slot_mapping.np[:3] = [10, 11, 12]
-
-    block_table.commit_slot_mapping(3)
-    assert block_table.slot_mapping.gpu.tolist() == [10, 11, 12, 99, 99, 99, 99, 99]
-
-    block_table.commit_slot_mapping_padding(6, 3)
-    assert block_table.slot_mapping.gpu.tolist() == [
-        10,
-        11,
-        12,
-        -1,
-        -1,
-        -1,
-        99,
-        99,
-    ]
-
-
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("batch_size", [1, 2, 32, 64])
 def test_sampling_metadata_in_input_batch(device: str, batch_size: int):

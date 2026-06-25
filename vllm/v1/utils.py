@@ -114,8 +114,7 @@ class CpuGpuBuffer:
         with_numpy: bool = True,
     ) -> None:
         self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
-        self.gpu = torch.empty_like(self.cpu, device=device)
-        self.gpu.copy_(self.cpu, non_blocking=False)
+        self.gpu = torch.zeros_like(self.cpu, device=device)
         self.np: np.ndarray
         # To keep type hints simple (avoiding generics and subclasses), we
         # only conditionally create the numpy array attribute. This can cause
@@ -132,11 +131,6 @@ class CpuGpuBuffer:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
-
-    def copy_slice_to_gpu(self, start: int, end: int) -> torch.Tensor:
-        if end <= start:
-            return self.gpu[start:end]
-        return self.gpu[start:end].copy_(self.cpu[start:end], non_blocking=True)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
