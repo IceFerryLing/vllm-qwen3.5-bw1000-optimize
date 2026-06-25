@@ -22,6 +22,11 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 _profile_logged_configs: set[tuple[object, ...]] = set()
 
 
+def _get_bool_env(name: str) -> bool:
+    value = os.environ.get(name, "").lower()
+    return value in ("1", "true", "yes", "on")
+
+
 def _get_block_m(num_queries_per_kv: int) -> int:
     block_m_override = os.environ.get("QWEN_UA_BLOCK_M")
     if not block_m_override:
@@ -185,6 +190,7 @@ def kernel_unified_attention_2d(
     SLIDING_WINDOW: tl.constexpr,  # int
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
+    USE_PAGE_LOCAL_FASTPATH: tl.constexpr,  # bool
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
@@ -330,22 +336,42 @@ def kernel_unified_attention_2d(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if USE_PAGE_LOCAL_FASTPATH:
+            block_start = j * TILE_SIZE
+            block_table_idx = block_start // BLOCK_SIZE
+            block_offset = block_start - block_table_idx * BLOCK_SIZE
+            if block_offset + TILE_SIZE <= BLOCK_SIZE:
+                physical_block_idx_scalar = tl.load(
+                    block_tables_ptr + block_table_offset + block_table_idx
+                ).to(tl.int64)
+                physical_block_idx = physical_block_idx_scalar + tl.full(
+                    [TILE_SIZE], 0, dtype=tl.int64
+                )
+                block_offsets = block_offset + offs_t
+            else:
+                block_table_indices = seq_offset // BLOCK_SIZE
+                physical_block_idx = tl.load(
+                    block_tables_ptr + block_table_offset + block_table_indices
+                ).to(tl.int64)
+                block_offsets = seq_offset - block_table_indices * BLOCK_SIZE
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+            block_offsets = seq_offset % BLOCK_SIZE
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
             + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            + block_offsets[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
             + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            + block_offsets[None, :] * stride_k_cache_1
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
@@ -1151,6 +1177,7 @@ def unified_attention(
             USE_SINKS=(sinks is not None),
             USE_MM_PREFIX=use_mm_prefix,
             MAX_MM_RANGES=max_mm_ranges,
+            USE_PAGE_LOCAL_FASTPATH=_get_bool_env("QWEN_UA_PAGE_LOCAL_FASTPATH"),
             mm_prefix_range_ptr=mm_prefix_range,
             SLIDING_WINDOW=(1 + window_size[0]),
             stride_k_cache_0=k.stride(0),
