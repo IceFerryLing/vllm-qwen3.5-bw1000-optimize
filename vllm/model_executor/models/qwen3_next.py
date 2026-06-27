@@ -393,17 +393,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.num_spec,
         )
 
-    def _make_core_attn_out(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.empty(
-            (
-                hidden_states.size(0),
-                self.num_v_heads // self.tp_size,
-                self.head_v_dim,
-            ),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -671,7 +660,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        core_attn_out = self._make_core_attn_out(hidden_states)
+        # Note: we should not use torch.empty here like other attention backends,
+        # see discussions in https://github.com/vllm-project/vllm/pull/28182
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
@@ -799,10 +794,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profiling runs do not execute the real GDN kernel below.
-            # Keep the previously-zeroed behavior for the projection that
-            # follows this custom op.
-            core_attn_out.zero_()
             # V1 profile run — warm up prefill kernels so that
             # autotuning completes before KV cache allocation.
             self._warmup_prefill_kernels(mixed_qkv)
@@ -811,10 +802,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        num_actual_tokens = attn_metadata.num_actual_tokens
-
-        if num_actual_tokens < core_attn_out.size(0):
-            core_attn_out[num_actual_tokens:].zero_()
 
         if (
             self.enable_packed_recurrent_decode
@@ -842,6 +829,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
