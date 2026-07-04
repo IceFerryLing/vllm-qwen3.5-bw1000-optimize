@@ -1172,7 +1172,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/attention.cu"
-    "csrc/rocm/my_ua_2d_kernel.cu")
+    "csrc/rocm/my_hip_ua2d.cu")
 
   define_extension_target(
     _rocm_C

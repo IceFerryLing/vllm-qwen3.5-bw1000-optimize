@@ -1,4 +1,4 @@
-// my_hip_unified_attention_2d.cu
+// my_hip_ua2d.cu
 // 自定义 HIP unified attention 2d kernel（prefill 主热点）
 // 核心优化：K 在 LDS 转置存储 [TILE_SIZE, HEAD_SIZE] + KT_STRIDE=260
 //   让 matrix_b 的「4行同列」读取变成「1行4连续列」→ ds_read2_b32 向量化 + bank conflict 4×↓
@@ -16,6 +16,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <limits>
 #include "du_mma_dtk_gfx936.h"
 
 #ifndef MY_UA_STANDALONE
@@ -23,6 +24,11 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#ifdef USE_ROCM
+#include <c10/hip/HIPException.h>
+#else
+#include <c10/cuda/CUDAException.h>
+#endif
 #endif
 
 using namespace du::dumma;
@@ -41,15 +47,25 @@ static constexpr int K_LOOP_PV = TILE_SIZE / MMA_K;       // 2（P@V 的 kk 循�
 static constexpr int N_LOOP_PV = HEAD_SIZE / MMA_N;       // 16（P@V 的 n_loop）
 static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 4（= warp 数）
 
-// K 转置版 LDS 行步进：KT_STRIDE=260
-//   朴素 256 → 16 col 全同 bank（BANK_CF 暴涨 499712）
-//   pad 260 → bank偏移2 → 16 col 全不同 + 相邻不共享（BANK_CF=8192，microbench 验证最优）
-static constexpr int KT_STRIDE = HEAD_SIZE + 4;           // 260
+// K 转置开关：默认开，保留 1.69× Q@K 单调用收益路径。
+//   如需 A/B 朴素布局，可编译时加 MY_UA_DISABLE_K_TRANSPOSE。
+//   关闭时 K 回朴素布局，LDS 从 33KB 降到 32KB，换取 occupancy 1→2 block/CU。
+//   tradeoff：K 转置降 bank conflict 但 BCF 未转化成 stall（WAIT_LDS 低）；
+//   撤转置让 BCF 回升但 occupancy 翻倍，global load latency hiding 改善。
+//   A/B 用 26 tile case wall-clock 对比。
+//   注：K 转置布局 [t, h]（stride KT_STRIDE=260）vs 朴素布局 [h, t]（stride TILE_SIZE=32）
+//       两者物理形状都是 [32, 256] 等价元素数，但行/列含义互换，stride 不同。
+#ifndef MY_UA_DISABLE_K_TRANSPOSE
+static constexpr int KT_STRIDE = HEAD_SIZE + 4;           // 260（转置：t 行 h 列）
+#else
+static constexpr int KT_STRIDE = TILE_SIZE;               // 32（朴素：h 行 t 列，stride=t 维宽）
+#endif
 
 // matrix_b row_major lane 映射（du_mma.hpp）：
 //   row = (lane_id >> 4) << 2, col = lane_id & 0xf, 每 lane 读 4 行同列
 // 转置后物理 K[t,h]：B[row+i, col] = K_logical[kk*16+row+i, n_loop*16+col]
 //   = k_smem[(n_loop*16+col)*KT_STRIDE + (kk*16+row+i)]，i=0..3 连续 bf16
+#ifndef MY_UA_DISABLE_K_TRANSPOSE
 __device__ __forceinline__ void load_k_frag_transpose(
     DUFragment<matrix_b, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> &b_frag,
     const __hip_bfloat16* __restrict__ k_smem,
@@ -64,6 +80,20 @@ __device__ __forceinline__ void load_k_frag_transpose(
     b_frag.x[2] = k_smem[base + 2];
     b_frag.x[3] = k_smem[base + 3];
 }
+#else
+// K 朴素 load（不转置，k_smem[h, t] 行主序，h 行 t 列，stride=KT_STRIDE=TILE_SIZE=32）
+//   B[row+i, col] = K_logical[kk*16+row+i, n_loop*16+col] = k_smem[(kk*16+row+i)*KT_STRIDE + (n_loop*16+col)]
+//   用 du_load_matrix_sync 黑盒 load（物理布局与 V 朴素同构，仅 stride 不同）
+__device__ __forceinline__ void load_k_frag_transpose(
+    DUFragment<matrix_b, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> &b_frag,
+    const __hip_bfloat16* __restrict__ k_smem,
+    int n_loop, int kk)
+{
+    const __hip_bfloat16* k_ptr =
+        k_smem + kk * MMA_K * KT_STRIDE + n_loop * MMA_N;
+    du_load_matrix_sync(b_frag, k_ptr, KT_STRIDE);
+}
+#endif
 
 // V 朴素 load（V 不转置，记忆 v-transpose-not-worth-it：V BANK_CF=1024/WAIT_LDS=0 不是瓶颈）
 //   V[t,h] 物理，B[row+i,col]=V[kk*16+row+i, n_loop*16+col]=v_smem[(kk*16+row+i)*V_STRIDE+(n_loop*16+col)]
@@ -89,7 +119,16 @@ __device__ __forceinline__ void load_v_frag(
 //   row = lane_id & 0xf（0-15），col_grp = lane_id >> 4（0-3）
 //   x[i] 对应列 col_grp + i*4（即 col_grp, col_grp+4, col_grp+8, col_grp+12）
 //   同一行的 4 个 lane（row 同，col_grp 0-3）需 reduce → __shfl_xor mask 16/32
-__global__ __launch_bounds__(256, 4)
+// LDS 占用（gfx936 LDS 64KB/CU）：
+//   K 转置：k_smem 32×260×2=16640B + v_smem 32×256×2=16384B = 33024B → 1 block/CU（放不下 2）
+//   K 朴素：k_smem 256×32×2=16384B + v_smem 32×256×2=16384B = 32768B → 2 block/CU（临界可放）
+//   launch_bounds 第二参数随开关给：转置=1（务实，避免编译器按 2 分寄存器导致 spill），
+//   朴素=2（让编译器按 2 block/CU 分寄存器，目标 occupancy 翻倍）。
+#ifndef MY_UA_DISABLE_K_TRANSPOSE
+__global__ __launch_bounds__(256, 1)
+#else
+__global__ __launch_bounds__(256, 2)
+#endif
 void my_hip_unified_attention_2d_kernel(
     __hip_bfloat16* __restrict__ output,        // [num_tokens, num_q_heads, head_size]
     const __hip_bfloat16* __restrict__ query,   // [num_tokens, num_q_heads, head_size]
@@ -108,6 +147,7 @@ void my_hip_unified_attention_2d_kernel(
     int output_stride_0,
     int output_stride_1,
     int BLOCK_SIZE,                             // 784
+    int num_seqs,
     long long stride_k_cache_0,
     long long stride_k_cache_1,
     long long stride_k_cache_2,
@@ -119,20 +159,30 @@ void my_hip_unified_attention_2d_kernel(
     const int kv_head_idx = blockIdx.y;
     const int tid = threadIdx.x;
     const int warpid = tid / 64;
-    const int BLOCK_Q = BLOCK_M;
+    // BLOCK_Q = 每个 q_block 覆盖的 query token 数（不是 BLOCK_M！）
+    //   BLOCK_M=64 是 mma 行数 = 16 query_token × 4 q_head（GQA packing）
+    //   BLOCK_Q = BLOCK_M / num_queries_per_kv = 16
+    const int BLOCK_Q = BLOCK_M / num_queries_per_kv;
 
 
-    // ---- find_seq_idx（线性查，TODO 二分）----
+    // ---- find_seq_idx（线性查，对齐 Triton q_block 模式）----
+    //   q_block 模式：seq s 的 q_block 范围是 [qsl[s]//BLOCK_Q + s, qsl[s+1]//BLOCK_Q + (s+1))
+    //   即把 query_start_len 转成 q_block 单位并加 seq 偏移（每 seq 的 q_block 局部编号从 0 开始）
+    //   host 用上界 floor(total_q/BLOCK_Q)+num_seqs 启动，可能多 launch 落在最后 seq 的 padding 区，
+    //   这种 block 会在下面 q_block_local_idx 检查处 return。s 越界保护：到 num_seqs 仍未找到则 return。
     int seq_idx = 0, q_start = 0, q_stop = 0;
     bool found = false;
-    for (int s = 0; !found; s++) {
+    for (int s = 0; s <= num_seqs && !found; s++) {
+        if (s >= num_seqs) break;  // 防止读 query_start_len[num_seqs+1] / seq_lens[num_seqs] 越界
         int start = query_start_len[s];
         int stop = query_start_len[s + 1];
-        if (q_block_idx * BLOCK_Q >= start && q_block_idx * BLOCK_Q < stop + 1) {
+        int qb_start = start / BLOCK_Q + s;
+        int qb_stop = stop / BLOCK_Q + (s + 1);
+        if (q_block_idx >= qb_start && q_block_idx < qb_stop) {
             seq_idx = s; q_start = start; q_stop = stop; found = true;
         }
-        if (s > 4096) break;
     }
+    if (!found) return;
     const int cur_batch_query_len = q_stop - q_start;
     const int q_block_local_idx = q_block_idx - (q_start / BLOCK_Q + seq_idx);
     if (q_block_local_idx * BLOCK_Q >= cur_batch_query_len) return;
@@ -141,18 +191,31 @@ void my_hip_unified_attention_2d_kernel(
     int context_len = seq_len - cur_batch_query_len;
     if (context_len < 0) context_len = 0;
 
-#ifdef MY_UA_QK_ONLY
-    if (tid == 0) {}  // 占位（去掉 printf）
-#endif
-
 
     const int m_base = warpid * MMA_M;  // 该 warp 负责的 offs_m 起始（0/16/32/48）
 
     // ---- LDS 分配 ----
-    __shared__ __hip_bfloat16 k_smem[TILE_SIZE * KT_STRIDE];  // 转置 [32, 260]
-    __shared__ __hip_bfloat16 v_smem[TILE_SIZE * HEAD_SIZE];  // 朴素 [32, 256]
+    // ---- LDS 分配 ----
+    //   转置：k_smem[t * KT_STRIDE + h]，KT_STRIDE=260，形状 [32, 260]，8320 bf16=16640B
+    //   朴素：k_smem[h * KT_STRIDE + t]，KT_STRIDE=TILE_SIZE=32，形状 [256, 32]，8192 bf16=16384B
+    //   两者元素数接近（8320 vs 8192），朴素省 256B（4 元素 pad），总 LDS 33024→32768B → 2 block/CU
+#ifndef MY_UA_DISABLE_K_TRANSPOSE
+    __shared__ __hip_bfloat16 k_smem[TILE_SIZE * (HEAD_SIZE + 4)];  // 转置 [32, 260]
+#else
+    __shared__ __hip_bfloat16 k_smem[HEAD_SIZE * TILE_SIZE];        // 朴素 [256, 32]
+#endif
+    __shared__ __hip_bfloat16 v_smem[TILE_SIZE * HEAD_SIZE];        // 朴素 [32, 256]
 
-    const int max_seq_prefix_len = seq_len;
+    // ---- causal num_tiles 剪枝（对齐 Triton max_seq_prefix_len 语义）----
+    //   只需覆盖当前 q_block 内最远 query token 能看到的 K 前缀：
+    //   context_len + q_block_local_idx*BLOCK_Q + (BLOCK_M-1)/num_queries_per_kv + 1
+    //   并上界到 seq_len（防止越界读 K cache）。远端 tile 由 mask 全置 -inf，跳过省算。
+    int max_seq_prefix_len = context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) / num_queries_per_kv
+        + 1;
+    if (max_seq_prefix_len > seq_len) max_seq_prefix_len = seq_len;
+    if (max_seq_prefix_len < 0) max_seq_prefix_len = 0;
     const int num_tiles = (max_seq_prefix_len + TILE_SIZE - 1) / TILE_SIZE;
 
     // ---- P@V accumulator（寄存器）：16 个 c_frag ----
@@ -186,7 +249,11 @@ void my_hip_unified_attention_2d_kernel(
                                     + (long long)blk_off * stride_v_cache_1
                                     + (long long)kv_head_idx * stride_v_cache_2 + h);
             }
-            k_smem[t * KT_STRIDE + h] = k_val;       // 转置写
+#ifndef MY_UA_DISABLE_K_TRANSPOSE
+            k_smem[t * KT_STRIDE + h] = k_val;       // 转置写：k_smem[t, h]
+#else
+            k_smem[h * KT_STRIDE + t] = k_val;       // 朴素写：k_smem[h, t]（KT_STRIDE=32）
+#endif
             v_smem[t * HEAD_SIZE + h] = v_val;       // 朴素写
         }
         __syncthreads();
@@ -205,14 +272,21 @@ void my_hip_unified_attention_2d_kernel(
             int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
             int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
             int q_token = q_start + q_pos;
+            // Q 越界 mask：q_pos >= cur_batch_query_len 的 lane 置 0，
+            //   避免越过本 seq Q tensor 边界读（尾 batch 时 UB）+ 不让垃圾 P 参与 P@V mma
+            bool q_valid = (q_pos < cur_batch_query_len) && (q_token < q_stop);
             const __hip_bfloat16* q_p =
                 query + (long long)q_token * query_stride_0
                       + (long long)q_head * query_stride_1
                       + (kk * MMA_K + q_col);
-            a_frag.x[0] = q_p[0];
-            a_frag.x[1] = q_p[1];
-            a_frag.x[2] = q_p[2];
-            a_frag.x[3] = q_p[3];
+            __hip_bfloat16 q0 = q_valid ? q_p[0] : __float2bfloat16(0.0f);
+            __hip_bfloat16 q1 = q_valid ? q_p[1] : __float2bfloat16(0.0f);
+            __hip_bfloat16 q2 = q_valid ? q_p[2] : __float2bfloat16(0.0f);
+            __hip_bfloat16 q3 = q_valid ? q_p[3] : __float2bfloat16(0.0f);
+            a_frag.x[0] = q0;
+            a_frag.x[1] = q1;
+            a_frag.x[2] = q2;
+            a_frag.x[3] = q3;
 
             DUFragment<matrix_b, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> b_frag;
             #pragma unroll
@@ -253,7 +327,7 @@ void my_hip_unified_attention_2d_kernel(
         }
 
 #ifdef MY_UA_QK_ONLY
-        // 诊断模式：store S（Q@K*scale，无 softmax/P@V）到 output，直接返回
+        // 诊断模式：store S（Q@K*scale，无 softmax/P@V）到 output
         {
             unsigned lane = __lane_id();
             unsigned row = lane & 0xf;
@@ -268,9 +342,6 @@ void my_hip_unified_attention_2d_kernel(
                     #pragma unroll
                     for (int i = 0; i < 4; i++) {
                         int h = n * MMA_N + col_grp + i * 4;
-                        // S 是 [BLOCK_M, TILE_SIZE]，h 这里当 col(0-31)
-                        // 但 output 是 [token, head, HEAD_SIZE=256]，不能直接塞
-                        // 诊断：把 S 存到 output 的前 TILE_SIZE 列（每 head 只存 col 0-31）
                         if (h < TILE_SIZE) {
                             __hip_bfloat16* o_ptr =
                                 output + (long long)q_token * output_stride_0
@@ -400,13 +471,96 @@ void my_hip_unified_attention_2d(
     double scale,
     int64_t block_size)
 {
-    TORCH_CHECK(query.is_cuda() && key_cache.is_cuda());
+    TORCH_CHECK(output.is_cuda() && query.is_cuda() && key_cache.is_cuda() &&
+                    value_cache.is_cuda() && block_table.is_cuda() &&
+                    seq_lens.is_cuda() && query_start_len.is_cuda(),
+                "my_hip_unified_attention_2d: all tensors must be CUDA tensors");
     const c10::cuda::CUDAGuard g(query.device());
 
-    const int num_q_blocks = output.size(0) / BLOCK_M;
+    TORCH_CHECK(output.device() == query.device() &&
+                    key_cache.device() == query.device() &&
+                    value_cache.device() == query.device() &&
+                    block_table.device() == query.device() &&
+                    seq_lens.device() == query.device() &&
+                    query_start_len.device() == query.device(),
+                "my_hip_unified_attention_2d: all tensors must be on the same CUDA device");
+    TORCH_CHECK(output.scalar_type() == torch::kBFloat16 &&
+                    query.scalar_type() == torch::kBFloat16 &&
+                    key_cache.scalar_type() == torch::kBFloat16 &&
+                    value_cache.scalar_type() == torch::kBFloat16,
+                "my_hip_unified_attention_2d: output, query, key_cache, and value_cache must be bf16");
+    TORCH_CHECK(block_table.scalar_type() == torch::kInt32 &&
+                    seq_lens.scalar_type() == torch::kInt32 &&
+                    query_start_len.scalar_type() == torch::kInt32,
+                "my_hip_unified_attention_2d: block_table, seq_lens, and query_start_len must be int32");
+    TORCH_CHECK(output.dim() == 3,
+                "my_hip_unified_attention_2d: output must be 3D [num_tokens,num_q_heads,head_size]");
+    TORCH_CHECK(query.dim() == 3,
+                "my_hip_unified_attention_2d: query must be 3D [num_tokens,num_q_heads,head_size]");
+    TORCH_CHECK(output.size(0) == query.size(0),
+                "my_hip_unified_attention_2d: output and query token dimensions must match");
+    TORCH_CHECK(output.size(1) == query.size(1),
+                "my_hip_unified_attention_2d: output and query head dimensions must match");
+    TORCH_CHECK(output.size(2) == HEAD_SIZE && query.size(2) == HEAD_SIZE,
+                "my_hip_unified_attention_2d: head_size must be 256");
+    TORCH_CHECK(output.stride(2) == 1 && query.stride(2) == 1,
+                "my_hip_unified_attention_2d: output/query head_size dim must be contiguous");
+    TORCH_CHECK(query.stride(0) <= std::numeric_limits<int>::max() &&
+                    query.stride(1) <= std::numeric_limits<int>::max() &&
+                    output.stride(0) <= std::numeric_limits<int>::max() &&
+                    output.stride(1) <= std::numeric_limits<int>::max(),
+                "my_hip_unified_attention_2d: query/output strides must fit int");
+
+    // kernel 用 +h 直接索引 head_size 维，要求该维 contiguous。
+    //   bf16 KV cache 是 4D [num_blks, block_size, num_kv_heads, head_size]，
+    //   head_size 维 = dim 3，stride(3) 应为 1。int8/5D 布局不支持（会读错），这里挡住。
+    TORCH_CHECK(key_cache.dim() == 4,
+        "my_hip_unified_attention_2d: key_cache must be 4D bf16 [num_blks,block_size,num_kv_heads,head_size]");
+    TORCH_CHECK(value_cache.dim() == 4,
+        "my_hip_unified_attention_2d: value_cache must be 4D bf16 [num_blks,block_size,num_kv_heads,head_size]");
+    TORCH_CHECK(key_cache.size(0) == value_cache.size(0) &&
+                    key_cache.size(1) == value_cache.size(1) &&
+                    key_cache.size(2) == value_cache.size(2) &&
+                    key_cache.size(3) == value_cache.size(3),
+                "my_hip_unified_attention_2d: key_cache and value_cache shapes must match");
+    TORCH_CHECK(key_cache.size(1) == block_size,
+                "my_hip_unified_attention_2d: block_size must match key_cache.size(1)");
+    TORCH_CHECK(key_cache.size(3) == HEAD_SIZE,
+                "my_hip_unified_attention_2d: KV cache head_size must be 256");
+    TORCH_CHECK(value_cache.size(3) == HEAD_SIZE,
+                "my_hip_unified_attention_2d: value_cache head_size must be 256");
+    TORCH_CHECK(key_cache.stride(3) == 1,
+        "my_hip_unified_attention_2d: key_cache head_size dim must be contiguous (stride(3)==1)");
+    TORCH_CHECK(value_cache.stride(3) == 1,
+        "my_hip_unified_attention_2d: value_cache head_size dim must be contiguous (stride(3)==1)");
+    TORCH_CHECK(block_table.dim() == 2,
+                "my_hip_unified_attention_2d: block_table must be 2D [num_seqs,max_num_blocks_per_seq]");
+    TORCH_CHECK(seq_lens.dim() == 1,
+                "my_hip_unified_attention_2d: seq_lens must be 1D [num_seqs]");
+    TORCH_CHECK(query_start_len.dim() == 1,
+                "my_hip_unified_attention_2d: query_start_len must be 1D [num_seqs+1]");
+
     const int num_kv_heads = key_cache.size(2);
     const int num_q_heads = num_kv_heads * 4;
     const int num_queries_per_kv = 4;
+    const int BLOCK_Q_host = BLOCK_M / num_queries_per_kv;   // 16
+    const int num_seqs = seq_lens.size(0);
+    TORCH_CHECK(num_kv_heads > 0,
+                "my_hip_unified_attention_2d: num_kv_heads must be positive");
+    TORCH_CHECK(output.size(1) == num_q_heads,
+                "my_hip_unified_attention_2d: output/query num_q_heads must equal key_cache.size(2) * 4");
+    TORCH_CHECK(block_table.size(0) >= num_seqs,
+                "my_hip_unified_attention_2d: block_table rows must cover seq_lens");
+    TORCH_CHECK(block_table.stride(0) > 0 && block_table.stride(0) <= std::numeric_limits<int>::max(),
+                "my_hip_unified_attention_2d: block_table stride(0) must fit int");
+    TORCH_CHECK(query_start_len.size(0) >= num_seqs + 1,
+                "my_hip_unified_attention_2d: query_start_len must have at least num_seqs + 1 entries");
+    TORCH_CHECK(block_size > 0 && block_size <= std::numeric_limits<int>::max(),
+                "my_hip_unified_attention_2d: block_size must fit int");
+
+    // Triton 上界：floor(total_q / BLOCK_Q) + num_seqs
+    //   （对齐 triton_unified_attention.py:994）
+    const int num_q_blocks = output.size(0) / BLOCK_Q_host + num_seqs;
 
     dim3 grid(num_q_blocks, num_kv_heads);
     dim3 block(256);
@@ -420,11 +574,17 @@ void my_hip_unified_attention_2d(
         query_start_len.data_ptr<int>(),
         static_cast<float>(scale),
         num_q_heads, num_kv_heads, num_queries_per_kv,
-        block_table.stride(0),
-        query.stride(0), query.stride(1),
-        output.stride(0), output.stride(1),
+        static_cast<int>(block_table.stride(0)),
+        static_cast<int>(query.stride(0)), static_cast<int>(query.stride(1)),
+        static_cast<int>(output.stride(0)), static_cast<int>(output.stride(1)),
         static_cast<int>(block_size),
+        num_seqs,
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2));
+#ifdef USE_ROCM
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+#else
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 #endif  // MY_UA_STANDALONE

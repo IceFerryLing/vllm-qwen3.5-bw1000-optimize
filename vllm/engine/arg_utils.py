@@ -616,6 +616,7 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
+    use_custom_ua2d: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1331,6 +1332,12 @@ class EngineArgs:
             default=None,
             help="Select GDN prefill backend.",
         )
+        parser.add_argument(
+            "--use-custom-ua2d",
+            action="store_true",
+            help="Route supported Triton unified attention 2D calls to the "
+            "custom ROCm kernel my_hip_ua2d.",
+        )
         return parser
 
     @classmethod
@@ -1919,6 +1926,8 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        if self.use_custom_ua2d:
+            self.additional_config["use_custom_ua2d"] = True
 
         config = VllmConfig(
             model_config=model_config,

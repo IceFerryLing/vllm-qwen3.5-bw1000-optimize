@@ -8,7 +8,7 @@ from typing import ClassVar
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -32,7 +32,10 @@ from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    is_batch_invariant,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -41,6 +44,50 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+CUSTOM_UA2D_CONFIG_KEY = "use_custom_ua2d"
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _custom_ua2d_enabled_from_config() -> bool:
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
+
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        return False
+
+    value = additional_config.get(
+        CUSTOM_UA2D_CONFIG_KEY,
+        additional_config.get("use-custom-ua2d", False),
+    )
+    return _as_bool(value)
+
+
+def _would_triton_use_ua2d(
+    max_seqlen_q: int,
+    num_seqs: int,
+    seq_threshold_3D: int | None,
+    num_par_softmax_segments: int | None,
+    softmax_segm_output: torch.Tensor | None,
+    softmax_segm_max: torch.Tensor | None,
+    softmax_segm_expsum: torch.Tensor | None,
+) -> bool:
+    return (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or max_seqlen_q > 1
+        or num_seqs > seq_threshold_3D
+        or is_batch_invariant
+    )
 
 
 @dataclass
@@ -407,6 +454,97 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
+        self.use_custom_ua2d = _custom_ua2d_enabled_from_config()
+
+    def _can_use_custom_ua2d(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        block_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        seq_threshold_3D: int | None,
+        num_par_softmax_segments: int | None,
+        softmax_segm_output: torch.Tensor | None,
+        softmax_segm_max: torch.Tensor | None,
+        softmax_segm_expsum: torch.Tensor | None,
+        output_scale: torch.Tensor | None,
+        mm_prefix_range_tensor: torch.Tensor | None,
+    ) -> bool:
+        if not current_platform.is_rocm():
+            return False
+        if self.attn_type != AttentionType.DECODER:
+            return False
+        if self.kv_cache_dtype.startswith("fp8"):
+            return False
+        if output_scale is not None or mm_prefix_range_tensor is not None:
+            return False
+        if self.alibi_slopes is not None or self.use_alibi_sqrt:
+            return False
+        if self.sinks is not None:
+            return False
+        if self.logits_soft_cap > 0 or self.sliding_window != (-1, -1):
+            return False
+        if self.head_size != 256 or self.num_queries_per_kv != 4:
+            return False
+        if not _would_triton_use_ua2d(
+            max_seqlen_q=max_seqlen_q,
+            num_seqs=seqused_k.shape[0],
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+        ):
+            return False
+
+        if query.dim() != 3 or output.dim() != 3:
+            return False
+        if key_cache.dim() != 4 or value_cache.dim() != 4:
+            return False
+        if (
+            query.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or key_cache.dtype != torch.bfloat16
+            or value_cache.dtype != torch.bfloat16
+        ):
+            return False
+        if (
+            block_table.dtype != torch.int32
+            or seqused_k.dtype != torch.int32
+            or cu_seqlens_q.dtype != torch.int32
+        ):
+            return False
+        if (
+            query.shape[1] != self.num_heads
+            or output.shape[1] != self.num_heads
+            or query.shape[2] != 256
+            or output.shape[2] != 256
+        ):
+            return False
+        if (
+            key_cache.shape[1] != value_cache.shape[1]
+            or key_cache.shape[2] != self.num_kv_heads
+            or value_cache.shape[2] != self.num_kv_heads
+            or key_cache.shape[3] != 256
+            or value_cache.shape[3] != 256
+        ):
+            return False
+        if (
+            query.stride(2) != 1
+            or output.stride(2) != 1
+            or key_cache.stride(3) != 1
+            or value_cache.stride(3) != 1
+        ):
+            return False
+        return (
+            block_table.dim() == 2
+            and seqused_k.dim() == 1
+            and cu_seqlens_q.dim() == 1
+        )
 
     def forward(
         self,
@@ -492,14 +630,49 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        q = query[:num_actual_tokens]
+        out = output[:num_actual_tokens]
 
+        if self.use_custom_ua2d and self._can_use_custom_ua2d(
+            query=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=out,
+            block_table=block_table,
+            seqused_k=seqused_k,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+            output_scale=output_scale,
+            mm_prefix_range_tensor=mm_prefix_range_tensor,
+        ):
+            from vllm import _custom_ops as ops
+
+            logger.info_once("Using custom kernel: my_hip_ua2d", scope="local")
+            ops.my_hip_unified_attention_2d(
+                out,
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                seqused_k,
+                cu_seqlens_q,
+                self.scale,
+                value_cache.shape[1],
+            )
+            return output
+
+        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         unified_attention(
-            q=query[:num_actual_tokens],
+            q=q,
             k=key_cache,
             v=value_cache,
-            out=output[:num_actual_tokens],
+            out=out,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k,
