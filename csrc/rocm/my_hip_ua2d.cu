@@ -17,7 +17,13 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <limits>
+
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx936__)
 #include "du_mma_dtk_gfx936.h"
+#define MY_UA_ENABLE_DUMMA 1
+#else
+#define MY_UA_ENABLE_DUMMA 0
+#endif
 
 #ifndef MY_UA_STANDALONE
 // 集成 vllm 时启用 torch 头 + launch 函数；裸编验证时用 -DMY_UA_STANDALONE 跳过
@@ -30,8 +36,6 @@
 #include <c10/cuda/CUDAException.h>
 #endif
 #endif
-
-using namespace du::dumma;
 
 // ===== 常量（Qwen3.5 full attention）=====
 //   HEAD_SIZE=256, num_attention_heads=16, num_key_value_heads=4, head_dim=256
@@ -46,6 +50,10 @@ static constexpr int N_LOOP = TILE_SIZE / MMA_N;          // 2（Q@K 的 n_loop�
 static constexpr int K_LOOP_PV = TILE_SIZE / MMA_K;       // 2（P@V 的 kk 循环）
 static constexpr int N_LOOP_PV = HEAD_SIZE / MMA_N;       // 16（P@V 的 n_loop）
 static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 4（= warp 数）
+
+#if MY_UA_ENABLE_DUMMA
+
+using namespace du::dumma;
 
 // K 转置开关：默认开，保留 1.69× Q@K 单调用收益路径。
 //   如需 A/B 朴素布局，可编译时加 MY_UA_DISABLE_K_TRANSPOSE。
@@ -457,6 +465,38 @@ void my_hip_unified_attention_2d_kernel(
     }
 #endif  // !MY_UA_QK_ONLY
 }
+
+#else
+
+__global__ void my_hip_unified_attention_2d_kernel(
+    __hip_bfloat16* __restrict__ output,
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key_cache,
+    const __hip_bfloat16* __restrict__ value_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_len,
+    float scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int num_queries_per_kv,
+    int block_table_stride,
+    int query_stride_0,
+    int query_stride_1,
+    int output_stride_0,
+    int output_stride_1,
+    int BLOCK_SIZE,
+    int num_seqs,
+    long long stride_k_cache_0,
+    long long stride_k_cache_1,
+    long long stride_k_cache_2,
+    long long stride_v_cache_0,
+    long long stride_v_cache_1,
+    long long stride_v_cache_2)
+{
+}
+
+#endif  // MY_UA_ENABLE_DUMMA
 
 // ===== host 端 launch =====
 #ifndef MY_UA_STANDALONE
