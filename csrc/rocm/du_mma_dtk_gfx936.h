@@ -479,8 +479,7 @@ __DU_MMA_DEVICE_DECL__ void du_mma_sync(DUFragment<accumulator, 16, 16, 64, int>
 #undef __DU_MMA_DEVICE_DECL__
 
 #if defined(__HIP_DEVICE_COMPILE__)
- #include "du_mma.hpp"
+ #include "du_mma_dtk_gfx936.hpp"
 #endif 
 
 #endif 
-
