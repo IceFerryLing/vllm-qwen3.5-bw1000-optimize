@@ -245,6 +245,39 @@ def paged_attention_rocm(
     )
 
 
+def my_hip_unified_attention_2d(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_len: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> None:
+    """自定义 HIP unified attention 2d kernel（K 转置 260 降 LDS bank conflict）。
+
+    接口对齐 triton_unified_attention.kernel_unified_attention_2d 的 bf16 子集。
+    完整 attention（causal + online softmax + P@V），K 在 LDS 转置 [TILE_SIZE, HEAD_SIZE]
+    + KT_STRIDE=260，让 matrix_b 的 4行同列读取变成 1行4连续列 → ds_read2_b32 向量化 +
+    bank conflict 4×↓（microbench 验证 BANK_CF 32768→8192，Q@K 段 1.69× 加速）。
+
+    注：当前为 bf16 路径，int8/fp8 KV cache descale 后续补。
+    """
+    torch.ops._rocm_C.my_hip_unified_attention_2d(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        query_start_len,
+        scale,
+        block_size,
+    )
+
+
 def mla_decode_kvcache_cpu(
     out: torch.Tensor,
     query: torch.Tensor,

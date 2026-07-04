@@ -28,3 +28,11 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+// 自定义 unified attention 2d kernel（K 转置 260 降 LDS bank conflict）
+//   接口对齐 triton_unified_attention.kernel_unified_attention_2d 的 bf16 子集
+void my_hip_unified_attention_2d(
+    torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, torch::Tensor& block_tables,
+    torch::Tensor& seq_lens, torch::Tensor& query_start_len,
+    double scale, int64_t block_size);

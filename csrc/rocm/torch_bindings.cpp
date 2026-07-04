@@ -58,6 +58,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // 自定义 unified attention 2d（K 转置 260 降 LDS bank conflict，bf16 子集）
+  rocm_ops.def(
+      "my_hip_unified_attention_2d(Tensor! out, Tensor query,"
+      "                          Tensor key_cache, Tensor value_cache,"
+      "                          Tensor block_tables, Tensor seq_lens,"
+      "                          Tensor query_start_len, float scale,"
+      "                          int block_size) -> ()");
+  rocm_ops.impl("my_hip_unified_attention_2d", torch::kCUDA,
+                &my_hip_unified_attention_2d);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
