@@ -10,8 +10,8 @@
 //   - online softmax（FlashAttention 风格，寄存器 accumulator + __shfl_xor 行 reduce）
 //   - K 转置 260 布局，V 朴素
 //   - BLOCK_SIZE=784 通用路径（seq_offset % BLOCK_SIZE，支持任意 block_size）
-//   - BLOCK_M=64，TILE_SIZE=32，HEAD_SIZE=256
-//     q_per_kv=6 时每个 q_block 覆盖 10 个完整 query token，最后 4 个 m 行 active_m mask 掉
+//   - BLOCK_M=96，TILE_SIZE=32，HEAD_SIZE=256
+//     q_per_kv=6 时每个 q_block 覆盖 16 个完整 query token
 //
 // 接口对齐 vllm triton_unified_attention.kernel_unified_attention_2d（子集）
 
@@ -44,13 +44,14 @@
 //   full attention 层：0-based 3,7,11,15,19,23,27,31
 static constexpr int HEAD_SIZE = 256;
 static constexpr int TILE_SIZE = 32;          // attention tile（K 的 t 维 tile）
-static constexpr int BLOCK_M = 64;            // 16 token × 4 q_head；q_per_kv=6 时 active_m mask 尾部
+static constexpr int BLOCK_M = 96;            // q_per_kv=6 时 16 token × 6 q_head
 static constexpr int MMA_M = 16, MMA_N = 16, MMA_K = 16;
 static constexpr int K_LOOP = HEAD_SIZE / MMA_K;          // 16（Q@K 的 kk 循环）
 static constexpr int N_LOOP = TILE_SIZE / MMA_N;          // 2（Q@K 的 n_loop）
 static constexpr int K_LOOP_PV = TILE_SIZE / MMA_K;       // 2（P@V 的 kk 循环）
 static constexpr int N_LOOP_PV = HEAD_SIZE / MMA_N;       // 16（P@V 的 n_loop）
-static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 4（= warp 数）
+static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 6（= wavefront 数）
+static constexpr int NUM_THREADS = MMA_M_LOOP * 64;
 
 #if MY_UA_ENABLE_DUMMA
 
@@ -118,8 +119,8 @@ __device__ __forceinline__ void load_v_frag(
 
 // ===== 主 kernel：my_hip_unified_attention_2d =====
 //   grid: (num_q_blocks, num_kv_heads)
-//   block: 256（4 warp × 64 lane），每 warp 算 16 行
-//   BLOCK_M=64。q_per_kv=6 时 BLOCK_Q=10，只启用前 60 行，尾部 4 行 active_m mask。
+//   block: 384（6 wavefront × 64 lane），每个 wavefront 算 16 行
+//   BLOCK_M=96。q_per_kv=6 时 BLOCK_Q=16，正好启用 96 行。
 //     offs_m = warpid*16 + (lane&0xf)
 //     query_pos = q_block_local*BLOCK_Q + offs_m // num_queries_per_kv
 //     q_head = kv_head_idx*num_queries_per_kv + offs_m % num_queries_per_kv
@@ -134,9 +135,9 @@ __device__ __forceinline__ void load_v_frag(
 //   launch_bounds 第二参数随开关给：转置=1（务实，避免编译器按 2 分寄存器导致 spill），
 //   朴素=2（让编译器按 2 block/CU 分寄存器，目标 occupancy 翻倍）。
 #ifndef MY_UA_DISABLE_K_TRANSPOSE
-__global__ __launch_bounds__(256, 1)
+__global__ __launch_bounds__(NUM_THREADS, 1)
 #else
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(NUM_THREADS, 2)
 #endif
 void my_hip_unified_attention_2d_kernel(
     __hip_bfloat16* __restrict__ output,        // [num_tokens, num_q_heads, head_size]
@@ -169,8 +170,8 @@ void my_hip_unified_attention_2d_kernel(
     const int tid = threadIdx.x;
     const int warpid = tid / 64;
     // BLOCK_Q = 每个 q_block 覆盖的 query token 数（不是 BLOCK_M！）
-    //   BLOCK_M=64 是 mma 行数；BLOCK_Q 向下取整，保证每个 q_block 只覆盖完整 query token。
-    //   q_per_kv=6 时 BLOCK_Q=10，active_m_count=60，尾部 4 行不参与 load/mask/store。
+    //   BLOCK_M=96 是 mma 行数；BLOCK_Q 向下取整，保证每个 q_block 只覆盖完整 query token。
+    //   q_per_kv=6 时 BLOCK_Q=16，active_m_count=96。
     const int BLOCK_Q = BLOCK_M / num_queries_per_kv;
     const int active_m_count = BLOCK_Q * num_queries_per_kv;
 
@@ -202,7 +203,7 @@ void my_hip_unified_attention_2d_kernel(
     if (context_len < 0) context_len = 0;
 
 
-    const int m_base = warpid * MMA_M;  // 该 warp 负责的 offs_m 起始（0/16/32/48）
+    const int m_base = warpid * MMA_M;  // 该 wavefront 负责的 offs_m 起始
 
     // ---- LDS 分配 ----
     // ---- LDS 分配 ----
@@ -236,11 +237,49 @@ void my_hip_unified_attention_2d_kernel(
     float M_row = -INFINITY;
     float L_row = 0.0f;
 
+    // ---- Q 一次性加载进寄存器 ----
+    // Q 只与 q_block/kv_head 相关，不随 K/V tile 变化。放在 tile 循环外，避免长 prefill
+    // 下按 num_tiles 重复读 global Q。
+    const unsigned lane = __lane_id();
+    const unsigned row = lane & 0xf;
+    const unsigned col_grp = lane >> 4;
+    const unsigned q_col = col_grp << 2;
+    const int offs_m = m_base + row;
+    const bool active_m = offs_m < active_m_count;
+    const int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
+    const int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
+    const int q_token = q_start + q_pos;
+    const bool q_valid = active_m && (q_pos < cur_batch_query_len) &&
+                         (q_token < q_stop) && (q_head < num_q_heads);
+    const int query_abs_pos = context_len + q_pos;
+    const int safe_q_token = q_valid ? q_token : 0;
+    const int safe_q_head = q_valid ? q_head : 0;
+
+    DUFragment<matrix_a, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> q_frag[K_LOOP];
+    #pragma unroll
+    for (int kk = 0; kk < K_LOOP; kk++) {
+        const __hip_bfloat16* q_p =
+            query + (long long)safe_q_token * query_stride_0
+                  + (long long)safe_q_head * query_stride_1
+                  + (kk * MMA_K + q_col);
+        q_frag[kk].x[0] = q_valid ? q_p[0] : __float2bfloat16(0.0f);
+        q_frag[kk].x[1] = q_valid ? q_p[1] : __float2bfloat16(0.0f);
+        q_frag[kk].x[2] = q_valid ? q_p[2] : __float2bfloat16(0.0f);
+        q_frag[kk].x[3] = q_valid ? q_p[3] : __float2bfloat16(0.0f);
+    }
+
     // ---- 主 tile 循环 ----
     for (int j = 0; j < num_tiles; j++) {
         const int seq_offset_base = j * TILE_SIZE;
+        const int page_bt_idx = seq_offset_base / BLOCK_SIZE;
+        const int page_blk_off = seq_offset_base - page_bt_idx * BLOCK_SIZE;
+        const bool page_local = page_blk_off + TILE_SIZE <= BLOCK_SIZE;
+        int page_phys_blk = 0;
+        if (page_local && seq_offset_base < max_seq_prefix_len) {
+            page_phys_blk = block_table[seq_idx * block_table_stride + page_bt_idx];
+        }
 
-        // ---- 协作加载 K/V tile（通用路径，BLOCK_SIZE=784 非 2 幂）----
+        // ---- 协作加载 K/V tile（page-local fastpath + 跨 page 通用路径）----
         for (int i = tid; i < HEAD_SIZE * TILE_SIZE; i += blockDim.x) {
             int h = i / TILE_SIZE;
             int t = i % TILE_SIZE;
@@ -248,9 +287,16 @@ void my_hip_unified_attention_2d_kernel(
             __hip_bfloat16 k_val = __float2bfloat16(0.0f);
             __hip_bfloat16 v_val = __float2bfloat16(0.0f);
             if (seq_off < max_seq_prefix_len) {
-                int bt_idx = seq_off / BLOCK_SIZE;
-                int blk_off = seq_off - bt_idx * BLOCK_SIZE;
-                int phys_blk = block_table[seq_idx * block_table_stride + bt_idx];
+                int blk_off;
+                int phys_blk;
+                if (page_local) {
+                    blk_off = page_blk_off + t;
+                    phys_blk = page_phys_blk;
+                } else {
+                    int bt_idx = seq_off / BLOCK_SIZE;
+                    blk_off = seq_off - bt_idx * BLOCK_SIZE;
+                    phys_blk = block_table[seq_idx * block_table_stride + bt_idx];
+                }
                 k_val = *(key_cache + (long long)phys_blk * stride_k_cache_0
                                     + (long long)blk_off * stride_k_cache_1
                                     + (long long)kv_head_idx * stride_k_cache_2 + h);
@@ -273,52 +319,17 @@ void my_hip_unified_attention_2d_kernel(
         du_fill_fragment(s_frag[1], 0.0f);
 
         for (int kk = 0; kk < K_LOOP; kk++) {  // 16
-            DUFragment<matrix_a, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> a_frag;
-            unsigned lane = __lane_id();
-            unsigned q_row = lane & 0xf;
-            unsigned q_col = (lane >> 4) << 2;
-            int offs_m = m_base + q_row;
-            bool active_m = offs_m < active_m_count;
-            int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
-            int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
-            int q_token = q_start + q_pos;
-            // Q 越界 mask：q_pos >= cur_batch_query_len 的 lane 置 0，
-            //   避免越过本 seq Q tensor 边界读（尾 batch 时 UB）+ 不让垃圾 P 参与 P@V mma
-            bool q_valid = active_m && (q_pos < cur_batch_query_len) &&
-                           (q_token < q_stop) && (q_head < num_q_heads);
-            int safe_q_token = q_valid ? q_token : 0;
-            int safe_q_head = q_valid ? q_head : 0;
-            const __hip_bfloat16* q_p =
-                query + (long long)safe_q_token * query_stride_0
-                      + (long long)safe_q_head * query_stride_1
-                      + (kk * MMA_K + q_col);
-            __hip_bfloat16 q0 = q_valid ? q_p[0] : __float2bfloat16(0.0f);
-            __hip_bfloat16 q1 = q_valid ? q_p[1] : __float2bfloat16(0.0f);
-            __hip_bfloat16 q2 = q_valid ? q_p[2] : __float2bfloat16(0.0f);
-            __hip_bfloat16 q3 = q_valid ? q_p[3] : __float2bfloat16(0.0f);
-            a_frag.x[0] = q0;
-            a_frag.x[1] = q1;
-            a_frag.x[2] = q2;
-            a_frag.x[3] = q3;
-
             DUFragment<matrix_b, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> b_frag;
             #pragma unroll
             for (int n = 0; n < N_LOOP; n++) {
                 load_k_frag_transpose(b_frag, k_smem, n, kk);
-                du_mma_sync(s_frag[n], a_frag, b_frag, s_frag[n]);
+                du_mma_sync(s_frag[n], q_frag[kk], b_frag, s_frag[n]);
             }
         }
 
         // ---- S = scale*Q@K + causal/seq mask ----
         //   s_frag[n].x[i] 对应 S[row, n*16 + col_grp + i*4]
         {
-            unsigned lane = __lane_id();
-            unsigned row = lane & 0xf;
-            unsigned col_grp = lane >> 4;
-            int offs_m = m_base + row;
-            bool active_m = offs_m < active_m_count;
-            int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
-            int query_abs_pos = context_len + q_pos;
             #pragma unroll
             for (int n = 0; n < N_LOOP; n++) {
                 #pragma unroll
@@ -329,9 +340,9 @@ void my_hip_unified_attention_2d_kernel(
 #ifdef MY_UA_QK_ONLY
                     // Q@K 诊断模式：不做 causal mask，但保留 active_m 防止 partial head 重复写。
                     (void)query_abs_pos;
-                    s_frag[n].x[i] = active_m ? s_val : -INFINITY;
+                    s_frag[n].x[i] = q_valid ? s_val : -INFINITY;
 #else
-                    if (!active_m || seq_off > query_abs_pos ||
+                    if (!q_valid || seq_off > query_abs_pos ||
                         seq_off >= max_seq_prefix_len) {
                         s_val = -INFINITY;
                     }
@@ -344,15 +355,7 @@ void my_hip_unified_attention_2d_kernel(
 #ifdef MY_UA_QK_ONLY
         // 诊断模式：store S（Q@K*scale，无 softmax/P@V）到 output
         {
-            unsigned lane = __lane_id();
-            unsigned row = lane & 0xf;
-            unsigned col_grp = lane >> 4;
-            int offs_m = m_base + row;
-            bool active_m = offs_m < active_m_count;
-            int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
-            int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
-            int q_token = q_start + q_pos;
-            if (active_m && q_token < q_stop) {
+            if (q_valid) {
                 #pragma unroll
                 for (int n = 0; n < N_LOOP; n++) {
                     #pragma unroll
@@ -422,9 +425,6 @@ void my_hip_unified_attention_2d_kernel(
         //   P[row, col_grp*4+i] 的值在 lane (row | (i<<4)) 的 s_frag[kk].x[col_grp]
         for (int kk = 0; kk < K_LOOP_PV; kk++) {  // 2
             DUFragment<matrix_a, MMA_M, MMA_N, MMA_K, __hip_bfloat16, row_major> p_frag;
-            unsigned lane = __lane_id();
-            unsigned row = lane & 0xf;
-            unsigned col_grp = lane >> 4;
             #pragma unroll
             for (int i = 0; i < 4; i++) {
                 unsigned src_lane = row | (i << 4);  // col_grp' = i 的同 row lane
@@ -449,15 +449,7 @@ void my_hip_unified_attention_2d_kernel(
 #ifndef MY_UA_QK_ONLY
     float inv_L = (L_row > 0.0f) ? (1.0f / L_row) : 0.0f;
     {
-        unsigned lane = __lane_id();
-        unsigned row = lane & 0xf;
-        unsigned col_grp = lane >> 4;
-        int offs_m = m_base + row;
-        bool active_m = offs_m < active_m_count;
-        int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
-        int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
-        int q_token = q_start + q_pos;
-        if (active_m && q_token < q_stop) {
+        if (q_valid) {
             #pragma unroll
             for (int n = 0; n < N_LOOP_PV; n++) {
                 #pragma unroll
@@ -614,7 +606,7 @@ void my_hip_unified_attention_2d(
     const int num_q_blocks = output.size(0) / BLOCK_Q_host + num_seqs;
 
     dim3 grid(num_q_blocks, num_kv_heads);
-    dim3 block(MMA_M_LOOP * 64);
+    dim3 block(NUM_THREADS);
     my_hip_unified_attention_2d_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<__hip_bfloat16*>(output.data_ptr()),
         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),

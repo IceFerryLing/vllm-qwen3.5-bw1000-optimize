@@ -45,7 +45,7 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 CUSTOM_UA2D_CONFIG_KEY = "use_custom_ua2d"
-CUSTOM_UA2D_BLOCK_M = 64
+CUSTOM_UA2D_BLOCK_M = 96
 
 
 def _as_bool(value: object) -> bool:
@@ -727,6 +727,7 @@ class TritonAttentionImpl(AttentionImpl):
             if reject_reason is None:
                 from vllm import _custom_ops as ops
 
+                logger.info_once("[my_hip_ua2d] BLOCK_M = 96", scope="local")
                 logger.info_once("Using custom kernel: my_hip_ua2d", scope="local")
                 ops.my_hip_unified_attention_2d(
                     out,
