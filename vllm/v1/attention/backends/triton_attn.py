@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 CUSTOM_UA2D_CONFIG_KEY = "use_custom_ua2d"
+CUSTOM_UA2D_BLOCK_M = 64
 
 
 def _as_bool(value: object) -> bool:
@@ -527,7 +528,7 @@ class TritonAttentionImpl(AttentionImpl):
                 f"logits_soft_cap={self.logits_soft_cap}, "
                 f"sliding_window={self.sliding_window}"
             )
-        if self.head_size != 256 or self.num_queries_per_kv != 4:
+        if self.head_size != 256 or self.num_queries_per_kv > CUSTOM_UA2D_BLOCK_M:
             return (
                 f"head_size={self.head_size}, "
                 f"num_queries_per_kv={self.num_queries_per_kv}"

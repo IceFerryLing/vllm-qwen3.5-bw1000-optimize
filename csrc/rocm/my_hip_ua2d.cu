@@ -10,7 +10,8 @@
 //   - online softmax（FlashAttention 风格，寄存器 accumulator + __shfl_xor 行 reduce）
 //   - K 转置 260 布局，V 朴素
 //   - BLOCK_SIZE=784 通用路径（seq_offset % BLOCK_SIZE，支持任意 block_size）
-//   - BLOCK_M=64(16 token × 4 q_head GQA packing), TILE_SIZE=32, HEAD_SIZE=256
+//   - BLOCK_M=64，TILE_SIZE=32，HEAD_SIZE=256
+//     q_per_kv=6 时每个 q_block 覆盖 10 个完整 query token，最后 4 个 m 行 active_m mask 掉
 //
 // 接口对齐 vllm triton_unified_attention.kernel_unified_attention_2d（子集）
 
@@ -43,7 +44,7 @@
 //   full attention 层：0-based 3,7,11,15,19,23,27,31
 static constexpr int HEAD_SIZE = 256;
 static constexpr int TILE_SIZE = 32;          // attention tile（K 的 t 维 tile）
-static constexpr int BLOCK_M = 64;            // 16 query_token × 4 q_head（GQA packing）
+static constexpr int BLOCK_M = 64;            // 16 token × 4 q_head；q_per_kv=6 时 active_m mask 尾部
 static constexpr int MMA_M = 16, MMA_N = 16, MMA_K = 16;
 static constexpr int K_LOOP = HEAD_SIZE / MMA_K;          // 16（Q@K 的 kk 循环）
 static constexpr int N_LOOP = TILE_SIZE / MMA_N;          // 2（Q@K 的 n_loop）
@@ -117,11 +118,11 @@ __device__ __forceinline__ void load_v_frag(
 
 // ===== 主 kernel：my_hip_unified_attention_2d =====
 //   grid: (num_q_blocks, num_kv_heads)
-//   block: 256（4 warp × 64 lane），每 warp 算 BLOCK_M/4=16 行
-//   BLOCK_M=64 = 16 query_token × 4 q_head（GQA packing，对齐 Triton）
+//   block: 256（4 warp × 64 lane），每 warp 算 16 行
+//   BLOCK_M=64。q_per_kv=6 时 BLOCK_Q=10，只启用前 60 行，尾部 4 行 active_m mask。
 //     offs_m = warpid*16 + (lane&0xf)
-//     query_pos = q_block_local*BLOCK_Q + offs_m // num_queries_per_kv（16 token）
-//     q_head = kv_head_idx*num_queries_per_kv + offs_m % num_queries_per_kv（4 head）
+//     query_pos = q_block_local*BLOCK_Q + offs_m // num_queries_per_kv
+//     q_head = kv_head_idx*num_queries_per_kv + offs_m % num_queries_per_kv
 //
 // DUMMA accumulator (16x16,k=16) lane 映射（du_mma.hpp store 反推）：
 //   row = lane_id & 0xf（0-15），col_grp = lane_id >> 4（0-3）
@@ -168,9 +169,10 @@ void my_hip_unified_attention_2d_kernel(
     const int tid = threadIdx.x;
     const int warpid = tid / 64;
     // BLOCK_Q = 每个 q_block 覆盖的 query token 数（不是 BLOCK_M！）
-    //   BLOCK_M=64 是 mma 行数 = 16 query_token × 4 q_head（GQA packing）
-    //   BLOCK_Q = BLOCK_M / num_queries_per_kv = 16
+    //   BLOCK_M=64 是 mma 行数；BLOCK_Q 向下取整，保证每个 q_block 只覆盖完整 query token。
+    //   q_per_kv=6 时 BLOCK_Q=10，active_m_count=60，尾部 4 行不参与 load/mask/store。
     const int BLOCK_Q = BLOCK_M / num_queries_per_kv;
+    const int active_m_count = BLOCK_Q * num_queries_per_kv;
 
 
     // ---- find_seq_idx（线性查，对齐 Triton q_block 模式）----
@@ -216,12 +218,11 @@ void my_hip_unified_attention_2d_kernel(
 
     // ---- causal num_tiles 剪枝（对齐 Triton max_seq_prefix_len 语义）----
     //   只需覆盖当前 q_block 内最远 query token 能看到的 K 前缀：
-    //   context_len + q_block_local_idx*BLOCK_Q + (BLOCK_M-1)/num_queries_per_kv + 1
+    //   context_len + q_block_local_idx*BLOCK_Q + BLOCK_Q
     //   并上界到 seq_len（防止越界读 K cache）。远端 tile 由 mask 全置 -inf，跳过省算。
     int max_seq_prefix_len = context_len
         + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) / num_queries_per_kv
-        + 1;
+        + BLOCK_Q;
     if (max_seq_prefix_len > seq_len) max_seq_prefix_len = seq_len;
     if (max_seq_prefix_len < 0) max_seq_prefix_len = 0;
     const int num_tiles = (max_seq_prefix_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -277,15 +278,19 @@ void my_hip_unified_attention_2d_kernel(
             unsigned q_row = lane & 0xf;
             unsigned q_col = (lane >> 4) << 2;
             int offs_m = m_base + q_row;
+            bool active_m = offs_m < active_m_count;
             int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
             int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
             int q_token = q_start + q_pos;
             // Q 越界 mask：q_pos >= cur_batch_query_len 的 lane 置 0，
             //   避免越过本 seq Q tensor 边界读（尾 batch 时 UB）+ 不让垃圾 P 参与 P@V mma
-            bool q_valid = (q_pos < cur_batch_query_len) && (q_token < q_stop);
+            bool q_valid = active_m && (q_pos < cur_batch_query_len) &&
+                           (q_token < q_stop) && (q_head < num_q_heads);
+            int safe_q_token = q_valid ? q_token : 0;
+            int safe_q_head = q_valid ? q_head : 0;
             const __hip_bfloat16* q_p =
-                query + (long long)q_token * query_stride_0
-                      + (long long)q_head * query_stride_1
+                query + (long long)safe_q_token * query_stride_0
+                      + (long long)safe_q_head * query_stride_1
                       + (kk * MMA_K + q_col);
             __hip_bfloat16 q0 = q_valid ? q_p[0] : __float2bfloat16(0.0f);
             __hip_bfloat16 q1 = q_valid ? q_p[1] : __float2bfloat16(0.0f);
@@ -311,6 +316,7 @@ void my_hip_unified_attention_2d_kernel(
             unsigned row = lane & 0xf;
             unsigned col_grp = lane >> 4;
             int offs_m = m_base + row;
+            bool active_m = offs_m < active_m_count;
             int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
             int query_abs_pos = context_len + q_pos;
             #pragma unroll
@@ -321,11 +327,12 @@ void my_hip_unified_attention_2d_kernel(
                     int seq_off = seq_offset_base + col;
                     float s_val = s_frag[n].x[i] * scale;
 #ifdef MY_UA_QK_ONLY
-                    // Q@K 诊断模式：不 mask，直接 store S
+                    // Q@K 诊断模式：不做 causal mask，但保留 active_m 防止 partial head 重复写。
                     (void)query_abs_pos;
-                    s_frag[n].x[i] = s_val;
+                    s_frag[n].x[i] = active_m ? s_val : -INFINITY;
 #else
-                    if (seq_off > query_abs_pos || seq_off >= max_seq_prefix_len) {
+                    if (!active_m || seq_off > query_abs_pos ||
+                        seq_off >= max_seq_prefix_len) {
                         s_val = -INFINITY;
                     }
                     s_frag[n].x[i] = s_val;
@@ -341,10 +348,11 @@ void my_hip_unified_attention_2d_kernel(
             unsigned row = lane & 0xf;
             unsigned col_grp = lane >> 4;
             int offs_m = m_base + row;
+            bool active_m = offs_m < active_m_count;
             int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
             int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
             int q_token = q_start + q_pos;
-            if (q_token < q_stop) {
+            if (active_m && q_token < q_stop) {
                 #pragma unroll
                 for (int n = 0; n < N_LOOP; n++) {
                     #pragma unroll
@@ -445,10 +453,11 @@ void my_hip_unified_attention_2d_kernel(
         unsigned row = lane & 0xf;
         unsigned col_grp = lane >> 4;
         int offs_m = m_base + row;
+        bool active_m = offs_m < active_m_count;
         int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
         int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
         int q_token = q_start + q_pos;
-        if (q_token < q_stop) {
+        if (active_m && q_token < q_stop) {
             #pragma unroll
             for (int n = 0; n < N_LOOP_PV; n++) {
                 #pragma unroll
@@ -581,14 +590,16 @@ void my_hip_unified_attention_2d(
                 "my_hip_unified_attention_2d: query_start_len must be 1D [num_seqs+1]");
 
     const int num_kv_heads = key_cache.size(2);
-    const int num_q_heads = num_kv_heads * 4;
-    const int num_queries_per_kv = 4;
-    const int BLOCK_Q_host = BLOCK_M / num_queries_per_kv;   // 16
-    const int num_seqs = seq_lens.size(0);
+    const int num_q_heads = output.size(1);
     TORCH_CHECK(num_kv_heads > 0,
                 "my_hip_unified_attention_2d: num_kv_heads must be positive");
-    TORCH_CHECK(output.size(1) == num_q_heads,
-                "my_hip_unified_attention_2d: output/query num_q_heads must equal key_cache.size(2) * 4");
+    TORCH_CHECK(num_q_heads > 0 && num_q_heads % num_kv_heads == 0,
+                "my_hip_unified_attention_2d: output/query num_q_heads must be a positive multiple of key_cache.size(2)");
+    const int num_queries_per_kv = num_q_heads / num_kv_heads;
+    TORCH_CHECK(num_queries_per_kv > 0 && num_queries_per_kv <= BLOCK_M,
+                "my_hip_unified_attention_2d: num_queries_per_kv must be in (0, BLOCK_M]");
+    const int BLOCK_Q_host = BLOCK_M / num_queries_per_kv;
+    const int num_seqs = seq_lens.size(0);
     TORCH_CHECK(block_table.size(0) >= num_seqs,
                 "my_hip_unified_attention_2d: block_table rows must cover seq_lens");
     TORCH_CHECK(block_table.stride(0) > 0 && block_table.stride(0) <= std::numeric_limits<int>::max(),
@@ -603,7 +614,7 @@ void my_hip_unified_attention_2d(
     const int num_q_blocks = output.size(0) / BLOCK_Q_host + num_seqs;
 
     dim3 grid(num_q_blocks, num_kv_heads);
-    dim3 block(256);
+    dim3 block(MMA_M_LOOP * 64);
     my_hip_unified_attention_2d_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<__hip_bfloat16*>(output.data_ptr()),
         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
