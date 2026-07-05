@@ -45,7 +45,9 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 CUSTOM_UA2D_CONFIG_KEY = "use_custom_ua2d"
-CUSTOM_UA2D_BLOCK_M = 96
+CUSTOM_UA2D_BLOCK_M = 64
+CUSTOM_UA2D_Q_PER_KV = 6
+CUSTOM_UA2D_BLOCK_SIZE = 784
 
 
 def _as_bool(value: object) -> bool:
@@ -528,7 +530,7 @@ class TritonAttentionImpl(AttentionImpl):
                 f"logits_soft_cap={self.logits_soft_cap}, "
                 f"sliding_window={self.sliding_window}"
             )
-        if self.head_size != 256 or self.num_queries_per_kv > CUSTOM_UA2D_BLOCK_M:
+        if self.head_size != 256 or self.num_queries_per_kv != CUSTOM_UA2D_Q_PER_KV:
             return (
                 f"head_size={self.head_size}, "
                 f"num_queries_per_kv={self.num_queries_per_kv}"
@@ -590,6 +592,7 @@ class TritonAttentionImpl(AttentionImpl):
             )
         if (
             key_cache.shape[1] != value_cache.shape[1]
+            or key_cache.shape[1] != CUSTOM_UA2D_BLOCK_SIZE
             or key_cache.shape[2] != self.num_kv_heads
             or value_cache.shape[2] != self.num_kv_heads
             or key_cache.shape[3] != 256
@@ -598,7 +601,8 @@ class TritonAttentionImpl(AttentionImpl):
             return (
                 f"key_cache.shape={tuple(key_cache.shape)}, "
                 f"value_cache.shape={tuple(value_cache.shape)}, "
-                f"num_kv_heads={self.num_kv_heads}"
+                f"num_kv_heads={self.num_kv_heads}, "
+                f"expected_block_size={CUSTOM_UA2D_BLOCK_SIZE}"
             )
         if (
             query.stride(2) != 1
@@ -727,7 +731,11 @@ class TritonAttentionImpl(AttentionImpl):
             if reject_reason is None:
                 from vllm import _custom_ops as ops
 
-                logger.info_once("[my_hip_ua2d] BLOCK_M = 96", scope="local")
+                logger.info_once("[my_hip_ua2d] BLOCK_M = 64", scope="local")
+                logger.info_once(
+                    "[my_hip_ua2d] Q_PER_KV = 6, BLOCK_SIZE = 784",
+                    scope="local",
+                )
                 logger.info_once("Using custom kernel: my_hip_ua2d", scope="local")
                 ops.my_hip_unified_attention_2d(
                     out,

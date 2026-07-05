@@ -9,9 +9,9 @@
 //   - causal mask
 //   - online softmax（FlashAttention 风格，寄存器 accumulator + __shfl_xor 行 reduce）
 //   - K 转置 260 布局，V 朴素
-//   - BLOCK_SIZE=784 通用路径（seq_offset % BLOCK_SIZE，支持任意 block_size）
-//   - BLOCK_M=96，TILE_SIZE=32，HEAD_SIZE=256
-//     q_per_kv=6 时每个 q_block 覆盖 16 个完整 query token
+//   - BLOCK_SIZE=784 固定 specialization（page-local fastpath + 跨 page fallback）
+//   - BLOCK_M=64，TILE_SIZE=32，HEAD_SIZE=256
+//     q_per_kv=6 时每个 q_block 覆盖 10 个完整 query token，最后 4 个 m 行 active_m mask 掉
 //
 // 接口对齐 vllm triton_unified_attention.kernel_unified_attention_2d（子集）
 
@@ -44,18 +44,29 @@
 //   full attention 层：0-based 3,7,11,15,19,23,27,31
 static constexpr int HEAD_SIZE = 256;
 static constexpr int TILE_SIZE = 32;          // attention tile（K 的 t 维 tile）
-static constexpr int BLOCK_M = 96;            // q_per_kv=6 时 16 token × 6 q_head
+static constexpr int BLOCK_M = 64;            // 16 token × 4 q_head；q_per_kv=6 时 active_m mask 尾部
+static constexpr int Q_PER_KV = 6;
+static constexpr int BLOCK_SIZE_CONST = 784;
 static constexpr int MMA_M = 16, MMA_N = 16, MMA_K = 16;
 static constexpr int K_LOOP = HEAD_SIZE / MMA_K;          // 16（Q@K 的 kk 循环）
 static constexpr int N_LOOP = TILE_SIZE / MMA_N;          // 2（Q@K 的 n_loop）
 static constexpr int K_LOOP_PV = TILE_SIZE / MMA_K;       // 2（P@V 的 kk 循环）
 static constexpr int N_LOOP_PV = HEAD_SIZE / MMA_N;       // 16（P@V 的 n_loop）
-static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 6（= wavefront 数）
+static constexpr int MMA_M_LOOP = BLOCK_M / MMA_M;        // 4（= wavefront 数）
 static constexpr int NUM_THREADS = MMA_M_LOOP * 64;
+static constexpr float LOG2E_F = 1.4426950408889634f;
 
 #if MY_UA_ENABLE_DUMMA
 
 using namespace du::dumma;
+
+__device__ __forceinline__ float fast_exp(float x) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+    return __builtin_amdgcn_exp2f(x * LOG2E_F);
+#else
+    return exp2f(x * LOG2E_F);
+#endif
+}
 
 // K 转置开关：默认开，保留 1.69× Q@K 单调用收益路径。
 //   如需 A/B 朴素布局，可编译时加 MY_UA_DISABLE_K_TRANSPOSE。
@@ -119,8 +130,8 @@ __device__ __forceinline__ void load_v_frag(
 
 // ===== 主 kernel：my_hip_unified_attention_2d =====
 //   grid: (num_q_blocks, num_kv_heads)
-//   block: 384（6 wavefront × 64 lane），每个 wavefront 算 16 行
-//   BLOCK_M=96。q_per_kv=6 时 BLOCK_Q=16，正好启用 96 行。
+//   block: 256（4 wavefront × 64 lane），每个 wavefront 算 16 行
+//   BLOCK_M=64。q_per_kv=6 时 BLOCK_Q=10，只启用前 60 行，尾部 4 行 active_m mask。
 //     offs_m = warpid*16 + (lane&0xf)
 //     query_pos = q_block_local*BLOCK_Q + offs_m // num_queries_per_kv
 //     q_head = kv_head_idx*num_queries_per_kv + offs_m % num_queries_per_kv
@@ -135,8 +146,10 @@ __device__ __forceinline__ void load_v_frag(
 //   launch_bounds 第二参数随开关给：转置=1（务实，避免编译器按 2 分寄存器导致 spill），
 //   朴素=2（让编译器按 2 block/CU 分寄存器，目标 occupancy 翻倍）。
 #ifndef MY_UA_DISABLE_K_TRANSPOSE
+template <int Q_PER_KV_, int BLOCK_SIZE_>
 __global__ __launch_bounds__(NUM_THREADS, 1)
 #else
+template <int Q_PER_KV_, int BLOCK_SIZE_>
 __global__ __launch_bounds__(NUM_THREADS, 2)
 #endif
 void my_hip_unified_attention_2d_kernel(
@@ -148,15 +161,11 @@ void my_hip_unified_attention_2d_kernel(
     const int* __restrict__ seq_lens,           // [num_seqs]
     const int* __restrict__ query_start_len,    // [num_seqs+1]
     float scale,
-    int num_q_heads,
-    int num_kv_heads,
-    int num_queries_per_kv,
     int block_table_stride,
     int query_stride_0,
     int query_stride_1,
     int output_stride_0,
     int output_stride_1,
-    int BLOCK_SIZE,                             // 784
     int num_seqs,
     long long stride_k_cache_0,
     long long stride_k_cache_1,
@@ -170,10 +179,10 @@ void my_hip_unified_attention_2d_kernel(
     const int tid = threadIdx.x;
     const int warpid = tid / 64;
     // BLOCK_Q = 每个 q_block 覆盖的 query token 数（不是 BLOCK_M！）
-    //   BLOCK_M=96 是 mma 行数；BLOCK_Q 向下取整，保证每个 q_block 只覆盖完整 query token。
-    //   q_per_kv=6 时 BLOCK_Q=16，active_m_count=96。
-    const int BLOCK_Q = BLOCK_M / num_queries_per_kv;
-    const int active_m_count = BLOCK_Q * num_queries_per_kv;
+    //   BLOCK_M=64 是 mma 行数；BLOCK_Q 向下取整，保证每个 q_block 只覆盖完整 query token。
+    //   q_per_kv=6 时 BLOCK_Q=10，active_m_count=60，尾部 4 行不参与 load/mask/store。
+    constexpr int BLOCK_Q = BLOCK_M / Q_PER_KV_;
+    constexpr int active_m_count = BLOCK_Q * Q_PER_KV_;
 
 
     // ---- find_seq_idx（线性查，对齐 Triton q_block 模式）----
@@ -246,11 +255,11 @@ void my_hip_unified_attention_2d_kernel(
     const unsigned q_col = col_grp << 2;
     const int offs_m = m_base + row;
     const bool active_m = offs_m < active_m_count;
-    const int q_pos = q_block_local_idx * BLOCK_Q + offs_m / num_queries_per_kv;
-    const int q_head = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv;
+    const int q_pos = q_block_local_idx * BLOCK_Q + offs_m / Q_PER_KV_;
+    const int q_head = kv_head_idx * Q_PER_KV_ + offs_m % Q_PER_KV_;
     const int q_token = q_start + q_pos;
     const bool q_valid = active_m && (q_pos < cur_batch_query_len) &&
-                         (q_token < q_stop) && (q_head < num_q_heads);
+                         (q_token < q_stop);
     const int query_abs_pos = context_len + q_pos;
     const int safe_q_token = q_valid ? q_token : 0;
     const int safe_q_head = q_valid ? q_head : 0;
@@ -271,9 +280,9 @@ void my_hip_unified_attention_2d_kernel(
     // ---- 主 tile 循环 ----
     for (int j = 0; j < num_tiles; j++) {
         const int seq_offset_base = j * TILE_SIZE;
-        const int page_bt_idx = seq_offset_base / BLOCK_SIZE;
-        const int page_blk_off = seq_offset_base - page_bt_idx * BLOCK_SIZE;
-        const bool page_local = page_blk_off + TILE_SIZE <= BLOCK_SIZE;
+        const int page_bt_idx = seq_offset_base / BLOCK_SIZE_;
+        const int page_blk_off = seq_offset_base - page_bt_idx * BLOCK_SIZE_;
+        const bool page_local = page_blk_off + TILE_SIZE <= BLOCK_SIZE_;
         int page_phys_blk = 0;
         if (page_local && seq_offset_base < max_seq_prefix_len) {
             page_phys_blk = block_table[seq_idx * block_table_stride + page_bt_idx];
@@ -293,8 +302,8 @@ void my_hip_unified_attention_2d_kernel(
                     blk_off = page_blk_off + t;
                     phys_blk = page_phys_blk;
                 } else {
-                    int bt_idx = seq_off / BLOCK_SIZE;
-                    blk_off = seq_off - bt_idx * BLOCK_SIZE;
+                    int bt_idx = seq_off / BLOCK_SIZE_;
+                    blk_off = seq_off - bt_idx * BLOCK_SIZE_;
                     phys_blk = block_table[seq_idx * block_table_stride + bt_idx];
                 }
                 k_val = *(key_cache + (long long)phys_blk * stride_k_cache_0
@@ -388,14 +397,15 @@ void my_hip_unified_attention_2d_kernel(
         float m_j = fmaxf(M_row, row_max);
         if (m_j == -INFINITY) m_j = 0.0f;  // 全 mask 行防 NaN
 
-        // ---- P = exp(S - m_j)，alpha = exp(M - m_j) ----
-        float alpha = (M_row == -INFINITY) ? 0.0f : expf(M_row - m_j);
+        // Triton lowers tl.exp to exp2(x * log2(e)); use the same fast path.
+        float alpha = (M_row == -INFINITY) ? 0.0f : fast_exp(M_row - m_j);
         #pragma unroll
         for (int n = 0; n < N_LOOP; n++) {
             #pragma unroll
             for (int i = 0; i < 4; i++) {
                 float s_val = s_frag[n].x[i];
-                s_frag[n].x[i] = (s_val == -INFINITY) ? 0.0f : expf(s_val - m_j);
+                s_frag[n].x[i] = (s_val == -INFINITY) ? 0.0f
+                                                      : fast_exp(s_val - m_j);
             }
         }
 
@@ -469,6 +479,7 @@ void my_hip_unified_attention_2d_kernel(
 
 #else
 
+template <int Q_PER_KV_, int BLOCK_SIZE_>
 __global__ void my_hip_unified_attention_2d_kernel(
     __hip_bfloat16* __restrict__ output,
     const __hip_bfloat16* __restrict__ query,
@@ -478,15 +489,11 @@ __global__ void my_hip_unified_attention_2d_kernel(
     const int* __restrict__ seq_lens,
     const int* __restrict__ query_start_len,
     float scale,
-    int num_q_heads,
-    int num_kv_heads,
-    int num_queries_per_kv,
     int block_table_stride,
     int query_stride_0,
     int query_stride_1,
     int output_stride_0,
     int output_stride_1,
-    int BLOCK_SIZE,
     int num_seqs,
     long long stride_k_cache_0,
     long long stride_k_cache_1,
@@ -588,9 +595,11 @@ void my_hip_unified_attention_2d(
     TORCH_CHECK(num_q_heads > 0 && num_q_heads % num_kv_heads == 0,
                 "my_hip_unified_attention_2d: output/query num_q_heads must be a positive multiple of key_cache.size(2)");
     const int num_queries_per_kv = num_q_heads / num_kv_heads;
-    TORCH_CHECK(num_queries_per_kv > 0 && num_queries_per_kv <= BLOCK_M,
-                "my_hip_unified_attention_2d: num_queries_per_kv must be in (0, BLOCK_M]");
-    const int BLOCK_Q_host = BLOCK_M / num_queries_per_kv;
+    TORCH_CHECK(num_queries_per_kv == Q_PER_KV,
+                "my_hip_unified_attention_2d: num_queries_per_kv must be 6");
+    TORCH_CHECK(block_size == BLOCK_SIZE_CONST,
+                "my_hip_unified_attention_2d: block_size must be 784");
+    constexpr int BLOCK_Q_host = BLOCK_M / Q_PER_KV;
     const int num_seqs = seq_lens.size(0);
     TORCH_CHECK(block_table.size(0) >= num_seqs,
                 "my_hip_unified_attention_2d: block_table rows must cover seq_lens");
@@ -607,7 +616,8 @@ void my_hip_unified_attention_2d(
 
     dim3 grid(num_q_blocks, num_kv_heads);
     dim3 block(NUM_THREADS);
-    my_hip_unified_attention_2d_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    my_hip_unified_attention_2d_kernel<Q_PER_KV, BLOCK_SIZE_CONST>
+        <<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<__hip_bfloat16*>(output.data_ptr()),
         reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
         reinterpret_cast<const __hip_bfloat16*>(key_cache.data_ptr()),
@@ -616,11 +626,9 @@ void my_hip_unified_attention_2d(
         seq_lens.data_ptr<int>(),
         query_start_len.data_ptr<int>(),
         static_cast<float>(scale),
-        num_q_heads, num_kv_heads, num_queries_per_kv,
         static_cast<int>(block_table.stride(0)),
         static_cast<int>(query.stride(0)), static_cast<int>(query.stride(1)),
         static_cast<int>(output.stride(0)), static_cast<int>(output.stride(1)),
-        static_cast<int>(block_size),
         num_seqs,
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2));
