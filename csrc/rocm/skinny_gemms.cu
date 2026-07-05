@@ -148,7 +148,7 @@ __global__ void LLGemm1_kernel(const scalar_t* in_a, const scalar_t* in_b,
   auto af4 = reinterpret_cast<const float4*>(in_a);
   auto bf4 = reinterpret_cast<const scalar2_t*>(in_b);
   auto c = reinterpret_cast<scalar2_t*>(out_c);
-  __shared__ float red_smem[NUM_A_ROWS_PER_BLOCK][WARP_SIZE];
+  __shared__ float red_smem[NUM_A_ROWS_PER_BLOCK][WARP_SIZE + 1];
   const int row_addr = blockIdx.x * NUM_A_ROWS_PER_BLOCK * K / 8;
   const int threadid = threadIdx.x;
   const int warp = threadIdx.x / WARP_SIZE;
