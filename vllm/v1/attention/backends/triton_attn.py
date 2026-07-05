@@ -474,22 +474,64 @@ class TritonAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None,
         mm_prefix_range_tensor: torch.Tensor | None,
     ) -> bool:
+        return self._custom_ua2d_reject_reason(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=output,
+            block_table=block_table,
+            seqused_k=seqused_k,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+            output_scale=output_scale,
+            mm_prefix_range_tensor=mm_prefix_range_tensor,
+        ) is None
+
+    def _custom_ua2d_reject_reason(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        block_table: torch.Tensor,
+        seqused_k: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        seq_threshold_3D: int | None,
+        num_par_softmax_segments: int | None,
+        softmax_segm_output: torch.Tensor | None,
+        softmax_segm_max: torch.Tensor | None,
+        softmax_segm_expsum: torch.Tensor | None,
+        output_scale: torch.Tensor | None,
+        mm_prefix_range_tensor: torch.Tensor | None,
+    ) -> str | None:
         if not current_platform.is_rocm():
-            return False
+            return "platform is not ROCm"
         if self.attn_type != AttentionType.DECODER:
-            return False
+            return f"attention type is {self.attn_type}, expected DECODER"
         if self.kv_cache_dtype.startswith("fp8"):
-            return False
+            return f"kv cache dtype is {self.kv_cache_dtype}"
         if output_scale is not None or mm_prefix_range_tensor is not None:
-            return False
+            return "output_scale or mm_prefix_range_tensor is set"
         if self.alibi_slopes is not None or self.use_alibi_sqrt:
-            return False
+            return "alibi is enabled"
         if self.sinks is not None:
-            return False
+            return "attention sinks are enabled"
         if self.logits_soft_cap > 0 or self.sliding_window != (-1, -1):
-            return False
+            return (
+                f"logits_soft_cap={self.logits_soft_cap}, "
+                f"sliding_window={self.sliding_window}"
+            )
         if self.head_size != 256 or self.num_queries_per_kv != 4:
-            return False
+            return (
+                f"head_size={self.head_size}, "
+                f"num_queries_per_kv={self.num_queries_per_kv}"
+            )
         if not _would_triton_use_ua2d(
             max_seqlen_q=max_seqlen_q,
             num_seqs=seqused_k.shape[0],
@@ -499,32 +541,52 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
         ):
-            return False
+            return (
+                "Triton would use 3D path: "
+                f"max_seqlen_q={max_seqlen_q}, "
+                f"num_seqs={seqused_k.shape[0]}, "
+                f"seq_threshold_3D={seq_threshold_3D}, "
+                f"num_par_softmax_segments={num_par_softmax_segments}"
+            )
 
         if query.dim() != 3 or output.dim() != 3:
-            return False
+            return f"query.dim={query.dim()}, output.dim={output.dim()}"
         if key_cache.dim() != 4 or value_cache.dim() != 4:
-            return False
+            return (
+                f"key_cache.dim={key_cache.dim()}, "
+                f"value_cache.dim={value_cache.dim()}"
+            )
         if (
             query.dtype != torch.bfloat16
             or output.dtype != torch.bfloat16
             or key_cache.dtype != torch.bfloat16
             or value_cache.dtype != torch.bfloat16
         ):
-            return False
+            return (
+                f"dtypes q={query.dtype}, out={output.dtype}, "
+                f"k={key_cache.dtype}, v={value_cache.dtype}"
+            )
         if (
             block_table.dtype != torch.int32
             or seqused_k.dtype != torch.int32
             or cu_seqlens_q.dtype != torch.int32
         ):
-            return False
+            return (
+                f"index dtypes block_table={block_table.dtype}, "
+                f"seqused_k={seqused_k.dtype}, "
+                f"cu_seqlens_q={cu_seqlens_q.dtype}"
+            )
         if (
             query.shape[1] != self.num_heads
             or output.shape[1] != self.num_heads
             or query.shape[2] != 256
             or output.shape[2] != 256
         ):
-            return False
+            return (
+                f"query.shape={tuple(query.shape)}, "
+                f"output.shape={tuple(output.shape)}, "
+                f"num_heads={self.num_heads}"
+            )
         if (
             key_cache.shape[1] != value_cache.shape[1]
             or key_cache.shape[2] != self.num_kv_heads
@@ -532,19 +594,28 @@ class TritonAttentionImpl(AttentionImpl):
             or key_cache.shape[3] != 256
             or value_cache.shape[3] != 256
         ):
-            return False
+            return (
+                f"key_cache.shape={tuple(key_cache.shape)}, "
+                f"value_cache.shape={tuple(value_cache.shape)}, "
+                f"num_kv_heads={self.num_kv_heads}"
+            )
         if (
             query.stride(2) != 1
             or output.stride(2) != 1
             or key_cache.stride(3) != 1
             or value_cache.stride(3) != 1
         ):
-            return False
-        return (
-            block_table.dim() == 2
-            and seqused_k.dim() == 1
-            and cu_seqlens_q.dim() == 1
-        )
+            return (
+                f"strides q={query.stride()}, out={output.stride()}, "
+                f"k={key_cache.stride()}, v={value_cache.stride()}"
+            )
+        if block_table.dim() != 2 or seqused_k.dim() != 1 or cu_seqlens_q.dim() != 1:
+            return (
+                f"metadata dims block_table={block_table.dim()}, "
+                f"seqused_k={seqused_k.dim()}, "
+                f"cu_seqlens_q={cu_seqlens_q.dim()}"
+            )
+        return None
 
     def forward(
         self,
@@ -634,38 +705,45 @@ class TritonAttentionImpl(AttentionImpl):
         q = query[:num_actual_tokens]
         out = output[:num_actual_tokens]
 
-        if self.use_custom_ua2d and self._can_use_custom_ua2d(
-            query=q,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            output=out,
-            block_table=block_table,
-            seqused_k=seqused_k,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seq_threshold_3D=seq_threshold_3D,
-            num_par_softmax_segments=num_par_softmax_segments,
-            softmax_segm_output=softmax_segm_output,
-            softmax_segm_max=softmax_segm_max,
-            softmax_segm_expsum=softmax_segm_expsum,
-            output_scale=output_scale,
-            mm_prefix_range_tensor=mm_prefix_range_tensor,
-        ):
-            from vllm import _custom_ops as ops
-
-            logger.info_once("Using custom kernel: my_hip_ua2d", scope="local")
-            ops.my_hip_unified_attention_2d(
-                out,
-                q,
-                key_cache,
-                value_cache,
-                block_table,
-                seqused_k,
-                cu_seqlens_q,
-                self.scale,
-                value_cache.shape[1],
+        if self.use_custom_ua2d:
+            reject_reason = self._custom_ua2d_reject_reason(
+                query=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                output=out,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seq_threshold_3D=seq_threshold_3D,
+                num_par_softmax_segments=num_par_softmax_segments,
+                softmax_segm_output=softmax_segm_output,
+                softmax_segm_max=softmax_segm_max,
+                softmax_segm_expsum=softmax_segm_expsum,
+                output_scale=output_scale,
+                mm_prefix_range_tensor=mm_prefix_range_tensor,
             )
-            return output
+            if reject_reason is None:
+                from vllm import _custom_ops as ops
+
+                logger.info_once("Using custom kernel: my_hip_ua2d", scope="local")
+                ops.my_hip_unified_attention_2d(
+                    out,
+                    q,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    cu_seqlens_q,
+                    self.scale,
+                    value_cache.shape[1],
+                )
+                return output
+            logger.info_once(
+                "Custom kernel my_hip_ua2d not used: %s",
+                reject_reason,
+                scope="local",
+            )
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         unified_attention(
