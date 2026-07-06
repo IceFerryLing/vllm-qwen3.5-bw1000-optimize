@@ -7,6 +7,8 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -18,6 +20,14 @@ logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 TRITON_UNIFIED_ATTN_BLOCK_M = 16
+
+# Prefill full-attention tile size. On gfx936 with HEAD_SIZE=256 the default 32
+# crushes occupancy via LDS pressure (1 wave/SIMD); 16 unlocks 2 waves/SIMD and
+# is 2.6-2.8x faster on-card, numerically equivalent (bf16 accumulation-order
+# rounding only). Env-overridable (set 32 to restore the upstream default).
+TRITON_UNIFIED_ATTN_PREFILL_TILE_SIZE = int(
+    os.environ.get("VLLM_PREFILL_ATTN_TILE_SIZE", "16")
+)
 
 
 def _get_block_m(num_queries_per_kv: int) -> int:
@@ -891,7 +901,7 @@ def _get_tile_size(
 
     # Default behavior
     if is_prefill:
-        return 32
+        return TRITON_UNIFIED_ATTN_PREFILL_TILE_SIZE
     return 16 if element_size >= 2 else 32
 
 
