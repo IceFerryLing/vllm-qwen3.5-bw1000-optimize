@@ -40,7 +40,13 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# Number of parallel tiled softmax segments for the 3D decode attention kernel.
+# On BW1000/gfx936 with head_dim=256, batch=1 decode has a ~250us fixed floor;
+# 16 segments leave long contexts (>=24K) under-parallelized. On-card sweep
+# 32 segments matches 16 for ctx<=16K and is +26~30% faster at
+# 24-32K (459->341us @32K), while 64 regresses (tiles/segment too small). The
+# extra segment buffer is ~8MB, negligible vs the 27B weights.
+NUM_PAR_SOFTMAX_SEGMENTS = 32  # Number of parallel tiled softmax segments
 
 
 @dataclass
