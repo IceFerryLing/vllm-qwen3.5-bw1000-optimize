@@ -115,6 +115,8 @@ patch的意思是，对远程工作区恢复到正确状态后，做小的优化
 需要询问用户，并将 goal 设置为 blocked。nodelist 下形如 `<COMPUTE_NODE>` 的 id 为计算节点 id，
 可以通过 ssh 连接。
 
+登录节点的端口为`<COMPETITION_LOGIN_PORT>`，用户名`c118-team`，ssh密钥为 `~/.ssh/<TEMPORARY_CREDENTIAL>`
+
 ssh 连接计算节点后，可以通过 `docker ps` 查看容器列表，`c118` 创建的容器为我们的容器，
 可以通过 `docker exec 容器id ...` 来访问。
 
@@ -132,6 +134,7 @@ ssh 连接计算节点后，可以通过 `docker ps` 查看容器列表，`c118`
 吞吐 A/B 或快速验证里用户说“跑三档各三组”“三档各 3 组”时，默认含义是跑三档
 `4-8K`、`8-16K`、`16-32K`，且每档传给 `run_throughput.sh` 的第二个参数为 `3`
 （即 `4-8K3`、`8-16K3`、`16-32K3` 这种短跑），不是每档重复三轮完整数据集。
+禁止绕过`run_throughput.sh` 跑自己的吞吐脚本。
 任何时候启动 baseline 前先查既有材料，避免重复下载、重复复制、构建或跑长任务：
 
 - 每次开始操作远端 `vllm_cscc` 前，必须先检查工作区状态，检查必须至少包含
@@ -150,7 +153,7 @@ ssh 连接计算节点后，可以通过 `docker ps` 查看容器列表，`c118`
 - 远端各工作区 `dist/` 目录下已经存在的所有 `vllm-*.whl` 默认都不可信，不能直接安装、
   提交或作为验证对象。需要 wheel 时，从已确认干净的源码状态重新构建，并把源码 commit、
   `git status --short` 输出、构建命令和 wheel 路径写入本次 run 目录。
-- **向远端工作区同步时，避免同步dtk-pdf文件夹**
+  构建wheel后，立刻告知用户wheel的编译路径。
 - 模型：`<TEAM_HOME> 已有完整副本；服务和脚本直接使用这个
   home 路径，也不要网络下载。
 - **Qwen3.5 权重加载必须提前准备 `runai-model-streamer`**：每个 fresh DCU 容器在启动
@@ -210,6 +213,8 @@ ssh 连接计算节点后，可以通过 `docker ps` 查看容器列表，`c118`
   只有 profiler 正常退出后的 db 才算有效产物。
   只要存在 -journal / -wal / -shm 或 profiler 非 0 退出，就视为无效 profile。不要对原始未确认状
   态的 db 执行 sqlite3 读取，因为这一步本身就可能触发 recovery。
+
+  整个工作流程开始时，告知用户本次run文件夹的路径。
 
 ## profile 工作流的使用
 
