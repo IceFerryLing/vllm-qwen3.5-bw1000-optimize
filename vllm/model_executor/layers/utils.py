@@ -128,7 +128,7 @@ def _llmm1_rows_per_block(m: int, k: int) -> int:
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx9, on_gfx950
+    from vllm.platforms.rocm import on_gfx9, on_gfx950, on_mi3xx
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -184,7 +184,9 @@ def rocm_unquantized_gemm_impl(
         return torch.nn.functional.linear(x, weight, bias)
 
     x_view = x.reshape(-1, x.size(-1))
-    if m > 8 and 0 < n <= 4:
+    if m > 8 and 0 < n <= 4 and on_mi3xx():
+        # wvSplitK relies on v_dot2c_f32_f16 / MFMA instructions only
+        # available on MI3XX (gfx942/gfx950); skip on gfx936.
         cu_count = num_compute_units()
         out = ops.wvSplitK(weight, x_view, cu_count, bias)
         return out.reshape(*x.shape[:-1], weight.shape[0])
