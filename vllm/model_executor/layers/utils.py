@@ -119,6 +119,12 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+def _llmm1_rows_per_block(m: int, k: int) -> int:
+    if k == 5120 and m in (14336, 16384, 34816, 248320):
+        return 8
+    return 4
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -190,7 +196,7 @@ def rocm_unquantized_gemm_impl(
             # Math-equivalent; requires m % 4 == 0 and k % 8 == 0.
             out = ops.LLMM_StridedK(weight, x_view, 4)
         else:
-            out = ops.LLMM1(weight, x_view, 4)
+            out = ops.LLMM1(weight, x_view, _llmm1_rows_per_block(m, k))
         return out.reshape(*x.shape[:-1], weight.shape[0])
     return torch.nn.functional.linear(x, weight, bias)
 
