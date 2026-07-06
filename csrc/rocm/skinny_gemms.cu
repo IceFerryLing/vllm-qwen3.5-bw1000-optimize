@@ -232,107 +232,6 @@ __global__ void LLGemm1_kernel(const scalar_t* in_a, const scalar_t* in_b,
   }
 }
 
-// Wide variant of LLGemm1_kernel: each thread processes 16 bf16 elements
-// (two float4 loads) instead of 8.  This halves the required thread count,
-// allowing K up to 16384 without exceeding the 1024 threads/block limit.
-template <typename scalar_t, int NUM_A_ROWS_PER_BLOCK>
-__global__ void LLGemm1_kernel_wide(const scalar_t* in_a, const scalar_t* in_b,
-                                    scalar_t* out_c, const int K) {
-  using scalar2_t = typename scalar2<scalar_t>::type;
-  auto af4 = reinterpret_cast<const float4*>(in_a);
-  auto bf4 = reinterpret_cast<const scalar2_t*>(in_b);
-  auto c = reinterpret_cast<scalar2_t*>(out_c);
-  __shared__ float red_smem[NUM_A_ROWS_PER_BLOCK][WARP_SIZE];
-  const int row_addr = blockIdx.x * NUM_A_ROWS_PER_BLOCK * K / 8;
-  const int threadid = threadIdx.x;
-  const int warp = threadIdx.x / WARP_SIZE;
-  const int lane = threadIdx.x % WARP_SIZE;
-  const int num_warps = blockDim.x / WARP_SIZE;
-  const int qwarpid = threadid / 16;
-  const int qthreadid = threadid % 16;
-  // Each thread loads TWO float4 = 16 bf16 elements from both A and B.
-  float4 rowA_elem4a[NUM_A_ROWS_PER_BLOCK];
-  float4 rowA_elem4b[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t colB_elem[8];  // 8 scalar2 = 16 scalars
-  float acc[NUM_A_ROWS_PER_BLOCK];
-  scalar2_t acch2;
-  scalar2_t oval;
-
-  // Each thread covers 16 elements; guard against out-of-range.
-  if (threadid * 16 < K) {
-#pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-      rowA_elem4a[i] = load_ntmprl(&af4[row_addr + threadid * 2 + K / 8 * i]);
-      rowA_elem4b[i] = load_ntmprl(&af4[row_addr + threadid * 2 + 1 + K / 8 * i]);
-    }
-    // Load 16 scalars from B (as 8 scalar2 pairs).
-    colB_elem[0] = bf4[threadid * 8 + 0];
-    colB_elem[1] = bf4[threadid * 8 + 1];
-    colB_elem[2] = bf4[threadid * 8 + 2];
-    colB_elem[3] = bf4[threadid * 8 + 3];
-    colB_elem[4] = bf4[threadid * 8 + 4];
-    colB_elem[5] = bf4[threadid * 8 + 5];
-    colB_elem[6] = bf4[threadid * 8 + 6];
-    colB_elem[7] = bf4[threadid * 8 + 7];
-  }
-
-  scalar2_t Af2;
-  float2 S;
-
-#pragma unroll
-  for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-    // Process first float4 (8 elements) from A row.
-    auto ah2a = reinterpret_cast<scalar2_t*>(&rowA_elem4a[i]);
-    Af2 = ah2a[0]; acch2 = __hmul2(Af2, colB_elem[0]);
-    Af2 = ah2a[1]; acch2 = __hfma2(Af2, colB_elem[1], acch2);
-    Af2 = ah2a[2]; acch2 = __hfma2(Af2, colB_elem[2], acch2);
-    Af2 = ah2a[3]; acch2 = __hfma2(Af2, colB_elem[3], acch2);
-    S = __s22float2(acch2);
-    float partial = S.x + S.y;
-
-    // Process second float4 (next 8 elements) from A row.
-    auto ah2b = reinterpret_cast<scalar2_t*>(&rowA_elem4b[i]);
-    Af2 = ah2b[0]; acch2 = __hmul2(Af2, colB_elem[4]);
-    Af2 = ah2b[1]; acch2 = __hfma2(Af2, colB_elem[5], acch2);
-    Af2 = ah2b[2]; acch2 = __hfma2(Af2, colB_elem[6], acch2);
-    Af2 = ah2b[3]; acch2 = __hfma2(Af2, colB_elem[7], acch2);
-    S = __s22float2(acch2);
-    partial += S.x + S.y;
-
-    acc[i] = (threadid * 16 < K ? partial : 0.f);
-  }
-
-  // All-reduce across warp.
-#pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-#pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-      acc[i] += __shfl_xor(acc[i], mask);
-    }
-  }
-
-  // Warp leaders store to shared memory.
-  if (lane < NUM_A_ROWS_PER_BLOCK) {
-    red_smem[lane][warp] = acc[lane];
-  }
-
-  __syncthreads();
-
-  if (qwarpid < NUM_A_ROWS_PER_BLOCK) {
-    acc[qwarpid] = qthreadid < num_warps ? red_smem[qwarpid][qthreadid] : 0.f;
-#pragma unroll
-    for (int mask = 16 / 2; mask >= 1; mask /= 2) {
-      acc[qwarpid] += __shfl_xor(acc[qwarpid], mask);
-    }
-    float oval2 = __shfl_xor(acc[qwarpid], 16);
-
-    if (lane % 32 == 0) {
-      oval = __float22s2_rn<scalar2_t>(make_float2(acc[qwarpid], oval2));
-      c[blockIdx.x * NUM_A_ROWS_PER_BLOCK / 2 + qwarpid / 2] = oval;
-    }
-  }
-}
-
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block) {
   auto M = in_a.size(0);
@@ -347,72 +246,40 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   auto out_c = torch::empty(
       {N, M}, torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
 
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-  // For K > 8192, use the wide kernel (16 elements/thread) to stay within
-  // the 1024 threads/block hardware limit.
-  const bool use_wide = (K > 8192);
-
-  int NUM_THREADS;
-  if (use_wide) {
-    // Wide path: each thread processes 16 bf16 → K/16 threads needed.
-    int raw = K * 2 / 32;  // = K / 16
-    NUM_THREADS = max((int)(rows_per_block * 16),
-                      raw % WARP_SIZE == 0
-                          ? raw
-                          : raw + (WARP_SIZE - raw % WARP_SIZE));
-  } else {
-    // Original path: each thread processes 8 bf16 → K/8 threads needed.
-    NUM_THREADS = max((int)(rows_per_block * 16),
-                      K * 2 / 16 % WARP_SIZE == 0
-                          ? K * 2 / 16
-                          : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
-  }
+  // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
+  // operations.
+  const int NUM_THREADS =
+      max(rows_per_block * 16,
+          K * 2 / 16 % WARP_SIZE == 0
+              ? K * 2 / 16
+              : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
 
   int NUM_BLOCKS = M / rows_per_block;
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // call the kernel function...
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "LLGemm1", [&] {
     auto a_ptr = in_a.data_ptr<scalar_t>();
     auto b_ptr = in_b.data_ptr<scalar_t>();
     auto c_ptr = out_c.data_ptr<scalar_t>();
-    if (use_wide) {
-      if (rows_per_block == 2) {
-        LLGemm1_kernel_wide<scalar_t, 2>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 4) {
-        LLGemm1_kernel_wide<scalar_t, 4>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 8) {
-        LLGemm1_kernel_wide<scalar_t, 8>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 16) {
-        LLGemm1_kernel_wide<scalar_t, 16>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else {
-        NUM_BLOCKS = M / 4;
-        LLGemm1_kernel_wide<scalar_t, 4>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      }
+    if (rows_per_block == 2) {
+      LLGemm1_kernel<scalar_t, 2>
+          <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
+    } else if (rows_per_block == 4) {
+      LLGemm1_kernel<scalar_t, 4>
+          <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
+    } else if (rows_per_block == 8) {
+      LLGemm1_kernel<scalar_t, 8>
+          <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
+    } else if (rows_per_block == 16) {
+      LLGemm1_kernel<scalar_t, 16>
+          <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
     } else {
-      if (rows_per_block == 2) {
-        LLGemm1_kernel<scalar_t, 2>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 4) {
-        LLGemm1_kernel<scalar_t, 4>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 8) {
-        LLGemm1_kernel<scalar_t, 8>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else if (rows_per_block == 16) {
-        LLGemm1_kernel<scalar_t, 16>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      } else {
-        NUM_BLOCKS = M / 4;
-        LLGemm1_kernel<scalar_t, 4>
-            <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
-      }
+      NUM_BLOCKS = M / 4;
+      LLGemm1_kernel<scalar_t, 4>
+          <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
     }
   });
 
