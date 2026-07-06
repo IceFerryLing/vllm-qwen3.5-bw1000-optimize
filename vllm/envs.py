@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
+    VLLM_ROCM_STRIDED_GEMV: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
@@ -982,6 +983,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # route N==1 decode GEMV to the strided-K LLMM kernel (gfx936 decode win);
+    # default on, math-equivalent to LLMM1 (set to 0 to fall back to LLMM1)
+    "VLLM_ROCM_STRIDED_GEMV": lambda: (
+        os.getenv("VLLM_ROCM_STRIDED_GEMV", "True").lower() in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

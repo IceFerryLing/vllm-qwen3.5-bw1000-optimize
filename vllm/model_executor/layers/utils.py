@@ -185,7 +185,12 @@ def rocm_unquantized_gemm_impl(
         out = ops.wvSplitK(weight, x_view, cu_count, bias)
         return out.reshape(*x.shape[:-1], weight.shape[0])
     elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
-        out = ops.LLMM1(weight, x_view, 4)
+        if envs.VLLM_ROCM_STRIDED_GEMV and k % 8 == 0:
+            # Strided-K GEMV: higher HBM bandwidth than LLMM1 on gfx936 decode.
+            # Math-equivalent; requires m % 4 == 0 and k % 8 == 0.
+            out = ops.LLMM_StridedK(weight, x_view, 4)
+        else:
+            out = ops.LLMM1(weight, x_view, 4)
         return out.reshape(*x.shape[:-1], weight.shape[0])
     return torch.nn.functional.linear(x, weight, bias)
 

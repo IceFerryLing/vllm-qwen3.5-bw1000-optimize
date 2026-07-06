@@ -20,6 +20,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("LLMM1", torch::kCUDA, &LLMM1);
 
+  // Strided-K variant of LLMM1 for N==1 decode GEMV (higher HBM BW on gfx936)
+  rocm_ops.def(
+      "LLMM_StridedK(Tensor in_a, Tensor in_b, int rows_per_block) -> "
+      "Tensor");
+  rocm_ops.impl("LLMM_StridedK", torch::kCUDA, &LLMM_StridedK);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

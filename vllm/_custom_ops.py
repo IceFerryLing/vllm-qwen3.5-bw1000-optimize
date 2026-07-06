@@ -2187,6 +2187,12 @@ def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor
     return torch.ops._rocm_C.LLMM1(a, b, rows_per_block)
 
 
+def LLMM_StridedK(
+    a: torch.Tensor, b: torch.Tensor, rows_per_block: int
+) -> torch.Tensor:
+    return torch.ops._rocm_C.LLMM_StridedK(a, b, rows_per_block)
+
+
 def wvSplitK(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:
