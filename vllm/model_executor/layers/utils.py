@@ -125,6 +125,12 @@ def _llmm1_rows_per_block(m: int, k: int) -> int:
     return 4
 
 
+def _strided_rows_per_block(m: int, k: int) -> int:
+    if k <= 8192:
+        return 2
+    return 4
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -190,13 +196,22 @@ def rocm_unquantized_gemm_impl(
         cu_count = num_compute_units()
         out = ops.wvSplitK(weight, x_view, cu_count, bias)
         return out.reshape(*x.shape[:-1], weight.shape[0])
+    elif (
+        m % 4 == 0
+        and n == 1
+        and bias is None
+        and envs.VLLM_ROCM_STRIDED_GEMV
+        and k % 8 == 0
+    ):
+        # Strided-K GEMV: higher/steadier HBM bandwidth than LLMM1 and rocBLAS on
+        # gfx936 decode. It grid-strides the K reduction, so it also handles large
+        # K (down_proj K=17408) that LLMM1 cannot: LLMM1's launch thread count is
+        # K*2/16, which exceeds the block limit for K>8192. rows_per_block is
+        # chosen by shape. Math-equivalent up to bf16.
+        out = ops.LLMM_StridedK(weight, x_view, _strided_rows_per_block(m, k))
+        return out.reshape(*x.shape[:-1], weight.shape[0])
     elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
-        if envs.VLLM_ROCM_STRIDED_GEMV and k % 8 == 0:
-            # Strided-K GEMV: higher HBM bandwidth than LLMM1 on gfx936 decode.
-            # Math-equivalent; requires m % 4 == 0 and k % 8 == 0.
-            out = ops.LLMM_StridedK(weight, x_view, 4)
-        else:
-            out = ops.LLMM1(weight, x_view, _llmm1_rows_per_block(m, k))
+        out = ops.LLMM1(weight, x_view, _llmm1_rows_per_block(m, k))
         return out.reshape(*x.shape[:-1], weight.shape[0])
     return torch.nn.functional.linear(x, weight, bias)
 
