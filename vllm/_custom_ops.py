@@ -2193,6 +2193,17 @@ def LLMM_StridedK(
     return torch.ops._rocm_C.LLMM_StridedK(a, b, rows_per_block)
 
 
+def qwen35_mlp_padded_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scratch: torch.Tensor,
+    padded_rows: int,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.qwen35_mlp_padded_gemm(
+        x, weight, scratch, padded_rows
+    )
+
+
 def wvSplitK(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

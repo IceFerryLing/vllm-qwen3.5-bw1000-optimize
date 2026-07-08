@@ -8,6 +8,11 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
 torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
                             const int64_t rows_per_block);
 
+torch::Tensor qwen35_mlp_padded_gemm(const at::Tensor& x,
+                                     const at::Tensor& weight,
+                                     at::Tensor& scratch,
+                                     const int64_t padded_rows);
+
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
                        const std::optional<at::Tensor>& in_bias,
                        const int64_t CuCount);

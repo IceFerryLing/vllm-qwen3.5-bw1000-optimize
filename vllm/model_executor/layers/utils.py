@@ -207,12 +207,80 @@ def rocm_unquantized_gemm_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
+def _qwen35_dense_mlp_pad_rows(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> int | None:
+    if not envs.VLLM_ROCM_QWEN35_MLP_PADDING:
+        return None
+    if bias is not None or x.dim() != 2:
+        return None
+    if x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
+        return None
+    if not x.is_contiguous() or not weight.is_contiguous():
+        return None
+    if not x.is_cuda or not weight.is_cuda or x.size(-1) != weight.shape[1]:
+        return None
+
+    n = x.shape[0]
+    m, k = weight.shape
+    prefix = getattr(layer, "prefix", "")
+    if prefix.endswith(".mlp.gate_up_proj") and (m, k) == (24576, 4096):
+        if n == 1:
+            return 2
+        if n == 3:
+            return 4
+        if n in (5, 6):
+            return 8
+    if prefix.endswith(".mlp.down_proj") and (m, k) == (4096, 12288) and n == 3:
+        return 4
+    return None
+
+
+def _qwen35_dense_mlp_padded_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    padded_rows = _qwen35_dense_mlp_pad_rows(layer, x, weight, bias)
+    if padded_rows is None:
+        return None
+
+    scratch_name = f"_qwen35_mlp_padding_scratch_{padded_rows}_{x.shape[-1]}"
+    scratch = getattr(layer, scratch_name, None)
+    if (
+        scratch is None
+        or scratch.shape != (padded_rows, x.shape[-1])
+        or scratch.dtype != x.dtype
+        or scratch.device != x.device
+    ):
+        scratch = torch.empty(
+            (padded_rows, x.shape[-1]), dtype=x.dtype, device=x.device
+        )
+        setattr(layer, scratch_name, scratch)
+
+    if hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "qwen35_mlp_padded_gemm"
+    ):
+        return ops.qwen35_mlp_padded_gemm(x, weight, scratch, padded_rows)
+
+    scratch[: x.shape[0]].copy_(x)
+    out = torch.ops.vllm.rocm_unquantized_gemm(scratch, weight, bias)
+    return out[: x.shape[0]]
+
+
 def rocm_unquantized_gemm(
     layer: torch.nn.Module,
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    padded_out = _qwen35_dense_mlp_padded_gemm(layer, x, weight, bias)
+    if padded_out is not None:
+        return padded_out
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 

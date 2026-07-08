@@ -26,6 +26,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("LLMM_StridedK", torch::kCUDA, &LLMM_StridedK);
 
+  // Qwen3.5 dense MLP small-N padding path. Copies x into a preallocated
+  // scratch buffer, runs rocBLAS GEMM on padded rows, and returns the first
+  // real rows.
+  rocm_ops.def(
+      "qwen35_mlp_padded_gemm(Tensor x, Tensor weight, Tensor! scratch, int "
+      "padded_rows) -> Tensor");
+  rocm_ops.impl("qwen35_mlp_padded_gemm", torch::kCUDA,
+                &qwen35_mlp_padded_gemm);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

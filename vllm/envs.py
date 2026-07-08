@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_STRIDED_GEMV: bool = True
+    VLLM_ROCM_QWEN35_MLP_PADDING: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
@@ -988,6 +989,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default on, math-equivalent to LLMM1 (set to 0 to fall back to LLMM1)
     "VLLM_ROCM_STRIDED_GEMV": lambda: (
         os.getenv("VLLM_ROCM_STRIDED_GEMV", "True").lower() in ("true", "1")
+    ),
+    # Pad selected Qwen3.5 dense MLP small-N BF16 GEMMs on ROCm to avoid
+    # hipBLAS kernel cliffs.
+    "VLLM_ROCM_QWEN35_MLP_PADDING": lambda: bool(
+        int(os.getenv("VLLM_ROCM_QWEN35_MLP_PADDING", "1"))
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

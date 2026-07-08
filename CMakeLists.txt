@@ -1170,14 +1170,27 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
+    "csrc/rocm/qwen35_mlp_gemm.cpp"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/attention.cu")
+
+  find_library(ROCBLAS_LIB
+    NAMES rocblas librocblas.so
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/rocblas/lib
+    NO_DEFAULT_PATH)
+  if(ROCBLAS_LIB)
+    message(STATUS "Found librocblas at ${ROCBLAS_LIB}")
+  else()
+    message(WARNING "librocblas not found in ${ROCM_PATH}; falling back to linking 'rocblas' by name")
+    set(ROCBLAS_LIB rocblas)
+  endif()
 
   define_extension_target(
     _rocm_C
     DESTINATION vllm
     LANGUAGE ${VLLM_GPU_LANG}
     SOURCES ${VLLM_ROCM_EXT_SRC}
+    LIBRARIES ${ROCBLAS_LIB}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
     USE_SABI 3
