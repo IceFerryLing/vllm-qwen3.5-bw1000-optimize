@@ -286,7 +286,7 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   return out_c;
 }
 
-// Strided-K GEMV for N==1 decode (bf16/fp16). Same math as LLGemm1 but each
+// Strided-K GEMV for N==1 decode (bf16/fp16). Each
 // block owns NUM_A_ROWS_PER_BLOCK output rows and its blockDim.x threads stride
 // over the K dimension in 8-element (float4) chunks, accumulating in registers.
 // This uses far fewer threads than LLGemm1 (which spawns K/8 threads), giving
@@ -321,19 +321,35 @@ __global__ void LLGemmStridedK_kernel(const scalar_t* in_a, const scalar_t* in_b
 #pragma unroll
     for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++)
       rowA_elem4[i] = load_ntmprl(&af4[row_base + kc + K8 * i]);
-    scalar2_t bx = bf4[kc * 4 + 0];
-    scalar2_t by = bf4[kc * 4 + 1];
-    scalar2_t bz = bf4[kc * 4 + 2];
-    scalar2_t bw = bf4[kc * 4 + 3];
+    scalar2_t b2[4] = {
+        bf4[kc * 4 + 0],
+        bf4[kc * 4 + 1],
+        bf4[kc * 4 + 2],
+        bf4[kc * 4 + 3],
+    };
 #pragma unroll
     for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
       auto ah2 = reinterpret_cast<scalar2_t*>(&rowA_elem4[i]);
-      scalar2_t h = __hmul2(ah2[0], bx);
-      h = __hfma2(ah2[1], by, h);
-      h = __hfma2(ah2[2], bz, h);
-      h = __hfma2(ah2[3], bw, h);
-      float2 S = __s22float2(h);
-      acc[i] += S.x + S.y;
+      if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+        // gfx936 has no packed BF16 dot/FMA instruction. __hfma2 on
+        // __hip_bfloat162 expands into a long emulation sequence and rounds
+        // after every pair. Convert the pairs and accumulate in FP32 instead;
+        // this is both faster and matches rocBLAS much more closely.
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          float2 af = __bfloat1622float2(ah2[j]);
+          float2 bf = __bfloat1622float2(b2[j]);
+          acc[i] = fmaf(af.x, bf.x, acc[i]);
+          acc[i] = fmaf(af.y, bf.y, acc[i]);
+        }
+      } else {
+        scalar2_t h = __hmul2(ah2[0], b2[0]);
+        h = __hfma2(ah2[1], b2[1], h);
+        h = __hfma2(ah2[2], b2[2], h);
+        h = __hfma2(ah2[3], b2[3], h);
+        float2 S = __s22float2(h);
+        acc[i] += S.x + S.y;
+      }
     }
   }
 

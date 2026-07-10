@@ -126,9 +126,17 @@ def _llmm1_rows_per_block(m: int, k: int) -> int:
 
 
 def _strided_rows_per_block(m: int, k: int) -> int:
-    if k <= 8192:
-        return 2
-    return 4
+    if k > 8192 and m % 8 == 0:
+        return 8
+    if k != 5120:
+        return 4
+    return 2
+
+
+def _use_strided_gemv(m: int, k: int) -> bool:
+    # Large vocabulary projections are faster in rocBLAS on gfx936. The
+    # custom kernel targets the repeated decoder projections instead.
+    return m < 65536 and k % 8 == 0
 
 
 def rocm_unquantized_gemm_impl(
@@ -201,11 +209,11 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and bias is None
         and envs.VLLM_ROCM_STRIDED_GEMV
-        and k % 8 == 0
+        and _use_strided_gemv(m, k)
     ):
-        # Strided-K GEMV: higher/steadier HBM bandwidth than LLMM1 and rocBLAS on
-        # gfx936 decode. It grid-strides the K reduction, so it also handles large
-        # K (down_proj K=17408) that LLMM1 cannot: LLMM1's launch thread count is
+        # Strided-K GEMV: higher/steadier HBM bandwidth on selected gfx936 decode
+        # shapes. It grid-strides the K reduction, so it also handles large K
+        # (down_proj K=17408) that LLMM1 cannot: LLMM1's launch thread count is
         # K*2/16, which exceeds the block limit for K>8192. rows_per_block is
         # chosen by shape. Math-equivalent up to bf16.
         out = ops.LLMM_StridedK(weight, x_view, _strided_rows_per_block(m, k))

@@ -190,6 +190,25 @@ def test_rocm_llmm1_kernel(n, k, m, dtype, rows_per_block, seed):
     torch.testing.assert_close(out, ref_out, atol=1e-8, rtol=1e-2)
 
 
+@pytest.mark.parametrize("k,m", [(5120, 6144), (17408, 5120)])
+@pytest.mark.parametrize("rows_per_block", [2, 4, 8])
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@torch.inference_mode()
+def test_rocm_llmm_strided_k_bf16_accuracy(k, m, rows_per_block):
+    torch.manual_seed(0)
+    x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+    weight = (
+        torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.02
+    )
+
+    ref_out = torch.nn.functional.linear(x, weight)
+    out = ops.LLMM_StridedK(weight, x, rows_per_block)
+
+    # The gfx936 path accumulates BF16 products in FP32. Keep this threshold
+    # tight enough to catch the old pairwise BF16 accumulation regression.
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-3)
+
+
 @pytest.mark.parametrize("xnorm", [False, True])
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK)
 @pytest.mark.parametrize("dtype", DTYPES)
