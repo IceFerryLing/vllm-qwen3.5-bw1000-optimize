@@ -57,17 +57,6 @@ void cp_gather_cache(
     torch::Tensor const& cu_seq_lens,  // [BATCH+1]
     int64_t batch_size, std::optional<torch::Tensor> seq_starts = std::nullopt);
 
-// Gather key and value caches in one traversal of the block table.
-void cp_gather_kv_cache(
-    torch::Tensor const& key_cache,
-    torch::Tensor const& value_cache,
-    torch::Tensor const& dst_key,
-    torch::Tensor const& dst_value,
-    torch::Tensor const& block_table,
-    torch::Tensor const& cu_seq_lens,
-    int64_t batch_size,
-    std::optional<torch::Tensor> seq_starts = std::nullopt);
-
 // Gather and upconvert FP8 KV cache to BF16 workspace
 void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE, 656]

@@ -2729,28 +2729,6 @@ def cp_gather_cache(
     )
 
 
-def cp_gather_kv_cache(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    dst_key: torch.Tensor,
-    dst_value: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seq_lens: torch.Tensor,
-    batch_size: int,
-    seq_starts: torch.Tensor | None = None,
-) -> None:
-    torch.ops._C_cache_ops.cp_gather_kv_cache(
-        key_cache,
-        value_cache,
-        dst_key,
-        dst_value,
-        block_table,
-        cu_seq_lens,
-        batch_size,
-        seq_starts,
-    )
-
-
 def cp_gather_and_upconvert_fp8_kv_cache(
     src_cache: torch.Tensor,
     dst: torch.Tensor,
