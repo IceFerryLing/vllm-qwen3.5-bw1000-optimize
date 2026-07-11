@@ -125,7 +125,11 @@ def _llmm1_rows_per_block(m: int, k: int) -> int:
     return 4
 
 
-def _strided_rows_per_block(m: int, k: int) -> int:
+def _strided_rows_per_block(
+    m: int, k: int, use_qwen35_down_rows1: bool = False
+) -> int:
+    if use_qwen35_down_rows1 and m == 5120 and k == 17408:
+        return 1
     if k > 8192 and m % 8 == 0:
         return 8
     if k != 5120:
@@ -230,7 +234,13 @@ def rocm_unquantized_gemm_impl(
         # (down_proj K=17408) that LLMM1 cannot: LLMM1's launch thread count is
         # K*2/16, which exceeds the block limit for K>8192. rows_per_block is
         # chosen by shape. Math-equivalent up to bf16.
-        out = ops.LLMM_StridedK(weight, x_view, _strided_rows_per_block(m, k))
+        out = ops.LLMM_StridedK(
+            weight,
+            x_view,
+            _strided_rows_per_block(
+                m, k, on_gfx936() and x.dtype == torch.bfloat16
+            ),
+        )
         return out.reshape(*x.shape[:-1], weight.shape[0])
     elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
         out = ops.LLMM1(weight, x_view, _llmm1_rows_per_block(m, k))

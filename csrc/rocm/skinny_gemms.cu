@@ -378,6 +378,70 @@ __global__ void LLGemmStridedK_kernel(const scalar_t* in_a, const scalar_t* in_b
   }
 }
 
+// Bandwidth-specialized Qwen3.5 decode down-projection GEMV for
+// [M, K] = [5120, 17408]. A block owns one output row, while 1024 threads
+// traverse its 2176 contiguous 16-byte chunks. Compared with the generic
+// rows=8/128 configuration, this exposes substantially more independent HBM
+// requests without duplicating weight reads. Keep prefetching disabled here:
+// at 1024 threads its extra live registers reduce performance on gfx936.
+template <typename scalar_t>
+__global__ __launch_bounds__(1024, 1) void LLGemmStridedKRows1Down_kernel(
+    const scalar_t* in_a, const scalar_t* in_b, scalar_t* out_c, const int K) {
+  using scalar2_t = typename scalar2<scalar_t>::type;
+  constexpr int NUM_THREADS = 1024;
+  constexpr int NUM_WAVES = NUM_THREADS / WARP_SIZE;
+  __shared__ float red_smem[NUM_WAVES];
+
+  const int tid = threadIdx.x;
+  const int lane = tid % WARP_SIZE;
+  const int wave = tid / WARP_SIZE;
+  const int K8 = K / 8;
+  const auto af4 = reinterpret_cast<const float4*>(in_a);
+  const auto bf4 = reinterpret_cast<const scalar2_t*>(in_b);
+  float acc = 0.f;
+
+  for (int kc = tid; kc < K8; kc += NUM_THREADS) {
+    const float4 row_a = load_ntmprl(&af4[blockIdx.x * K8 + kc]);
+    const auto a2 = reinterpret_cast<const scalar2_t*>(&row_a);
+    const scalar2_t b2[4] = {
+        bf4[kc * 4 + 0],
+        bf4[kc * 4 + 1],
+        bf4[kc * 4 + 2],
+        bf4[kc * 4 + 3],
+    };
+
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+        const float2 af = __bfloat1622float2(a2[j]);
+        const float2 bf = __bfloat1622float2(b2[j]);
+        acc = fmaf(af.x, bf.x, acc);
+        acc = fmaf(af.y, bf.y, acc);
+      } else {
+        const scalar2_t h = __hmul2(a2[j], b2[j]);
+        const float2 f = __s22float2(h);
+        acc += f.x + f.y;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2)
+    acc += __shfl_xor(acc, mask);
+
+  if (lane == 0) red_smem[wave] = acc;
+  __syncthreads();
+
+  if (tid == 0) {
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < NUM_WAVES; i++) sum += red_smem[i];
+    const scalar2_t packed =
+        __float22s2_rn<scalar2_t>(make_float2(sum, 0.f));
+    out_c[blockIdx.x] = reinterpret_cast<const scalar_t*>(&packed)[0];
+  }
+}
+
 // Fused Qwen3.5 gate_up GEMV and SwiGLU for N==1 BF16 decode. Each block
 // computes matching gate/up rows, which are separated by D rows in the merged
 // weight. Rounding is intentionally identical to Qwen3.5's Inductor-native
@@ -463,8 +527,13 @@ torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
   TORCH_CHECK(in_b.dtype() == torch::kFloat16 ||
               in_b.dtype() == torch::kBFloat16);
   TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8.");
-  TORCH_CHECK(rows_per_block % 2 == 0 && M % rows_per_block == 0,
-              "rows_per_block must be even and divide M.");
+  const bool use_rows1_down =
+      rows_per_block == 1 && M == 5120 && K == 17408 &&
+      in_b.dtype() == torch::kBFloat16;
+  TORCH_CHECK(use_rows1_down ||
+                  (rows_per_block % 2 == 0 && M % rows_per_block == 0),
+              "rows_per_block must be even and divide M, except for the "
+              "Qwen3.5 BF16 [5120, 17408] rows=1 specialization.");
 
   auto out_c = torch::empty(
       {N, M}, torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
@@ -484,7 +553,10 @@ torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
     auto a_ptr = in_a.data_ptr<scalar_t>();
     auto b_ptr = in_b.data_ptr<scalar_t>();
     auto c_ptr = out_c.data_ptr<scalar_t>();
-    if (rows_per_block == 2) {
+    if (use_rows1_down) {
+      LLGemmStridedKRows1Down_kernel<scalar_t>
+          <<<M, 1024, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
+    } else if (rows_per_block == 2) {
       LLGemmStridedK_kernel<scalar_t, 2>
           <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, K);
     } else if (rows_per_block == 8) {

@@ -209,6 +209,21 @@ def test_rocm_llmm_strided_k_bf16_accuracy(k, m, rows_per_block):
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-3)
 
 
+@pytest.mark.skipif(not on_gfx936(), reason="kernel is tuned for gfx936")
+@torch.inference_mode()
+def test_rocm_llmm_strided_k_qwen35_down_rows1_accuracy():
+    torch.manual_seed(0)
+    k = 17408
+    m = 5120
+    x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.02
+
+    ref_out = torch.nn.functional.linear(x, weight)
+    out = ops.LLMM_StridedK(weight, x, 1)
+
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-3)
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
 @torch.inference_mode()
 def test_rocm_llmm_silu_mul_matches_unfused():
