@@ -1136,6 +1136,69 @@ __global__ void cp_gather_cache(
     }
   }
 }
+
+template <typename scalar_t>
+// Gather key and value entries together so that both copies share block-table
+// lookup and sequence-offset arithmetic.
+__global__ void cp_gather_kv_cache_kernel(
+    const scalar_t* __restrict__ key_cache,
+    const scalar_t* __restrict__ value_cache,
+    scalar_t* __restrict__ dst_key,
+    scalar_t* __restrict__ dst_value,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seq_lens, const int32_t block_size,
+    const int32_t entry_size, const int64_t block_table_stride,
+    const int64_t key_block_stride, const int64_t value_block_stride,
+    const int64_t key_entry_stride, const int64_t value_entry_stride,
+    const int64_t dst_key_entry_stride,
+    const int64_t dst_value_entry_stride,
+    const int32_t* __restrict__ seq_starts) {
+  const int64_t bid = blockIdx.x;
+  const int32_t num_splits = gridDim.y;
+  const int32_t split = blockIdx.y;
+  const int32_t seq_start = cu_seq_lens[bid];
+  const int32_t seq_len = cu_seq_lens[bid + 1] - seq_start;
+  const int32_t split_slots = cuda_utils::ceil_div(seq_len, num_splits);
+  const int32_t split_start = split * split_slots;
+  const int32_t split_end = min((split + 1) * split_slots, seq_len);
+
+  if (split_start >= seq_len) return;
+
+  int32_t offset = split_start;
+  if (seq_starts != nullptr) {
+    offset += seq_starts[bid];
+  }
+  int32_t offset_div = offset / block_size;
+  offset %= block_size;
+
+  const int32_t* batch_block_table =
+      block_table + bid * block_table_stride;
+  dst_key += seq_start * dst_key_entry_stride;
+  dst_value += seq_start * dst_value_entry_stride;
+
+  for (int32_t pid = split_start; pid < split_end; ++pid) {
+    const int32_t block_id = batch_block_table[offset_div];
+    const scalar_t* key_src =
+        key_cache + block_id * key_block_stride + offset * key_entry_stride;
+    const scalar_t* value_src = value_cache + block_id * value_block_stride +
+                                offset * value_entry_stride;
+    scalar_t* key_dst = dst_key + pid * dst_key_entry_stride;
+    scalar_t* value_dst = dst_value + pid * dst_value_entry_stride;
+
+    for (int32_t i = threadIdx.x; i < entry_size; i += blockDim.x) {
+      key_dst[i] = key_src[i];
+    }
+    for (int32_t i = threadIdx.x; i < entry_size; i += blockDim.x) {
+      value_dst[i] = value_src[i];
+    }
+
+    ++offset;
+    if (offset == block_size) {
+      ++offset_div;
+      offset = 0;
+    }
+  }
+}
 }  // namespace vllm
 
 // Macro to dispatch the kernel based on the data type.
@@ -1146,6 +1209,17 @@ __global__ void cp_gather_cache(
       block_table.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(), \
       block_size, entry_size, block_table_stride, cache_block_stride,   \
       cache_entry_stride, dst_entry_stride, seq_starts_ptr);
+
+#define CALL_CP_GATHER_KV_CACHE(CPY_DTYPE)                              \
+  vllm::cp_gather_kv_cache_kernel<CPY_DTYPE><<<grid, block, 0, stream>>>( \
+      reinterpret_cast<CPY_DTYPE*>(key_cache.data_ptr()),               \
+      reinterpret_cast<CPY_DTYPE*>(value_cache.data_ptr()),             \
+      reinterpret_cast<CPY_DTYPE*>(dst_key.data_ptr()),                 \
+      reinterpret_cast<CPY_DTYPE*>(dst_value.data_ptr()),               \
+      block_table.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(), \
+      block_size, entry_size, block_table_stride, key_block_stride,     \
+      value_block_stride, key_entry_stride, value_entry_stride,         \
+      dst_key_entry_stride, dst_value_entry_stride, seq_starts_ptr);
 
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
@@ -1208,6 +1282,79 @@ void cp_gather_cache(
     CALL_CP_GATHER_CACHE(uint16_t);
   } else if (dtype_bits == 8) {
     CALL_CP_GATHER_CACHE(uint8_t);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
+  }
+}
+
+void cp_gather_kv_cache(
+    torch::Tensor const& key_cache,
+    torch::Tensor const& value_cache,
+    torch::Tensor const& dst_key,
+    torch::Tensor const& dst_value,
+    torch::Tensor const& block_table,
+    torch::Tensor const& cu_seq_lens,
+    int64_t batch_size,
+    std::optional<torch::Tensor> seq_starts = std::nullopt) {
+  at::cuda::OptionalCUDAGuard device_guard(key_cache.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const int32_t block_size = key_cache.size(1);
+  const int32_t entry_size = key_cache.flatten(2, -1).size(2);
+
+  TORCH_CHECK(block_table.dtype() == torch::kInt32,
+              "block_table must be int32");
+  TORCH_CHECK(cu_seq_lens.dtype() == torch::kInt32,
+              "cu_seq_lens must be int32");
+  if (seq_starts.has_value()) {
+    TORCH_CHECK(seq_starts.value().dtype() == torch::kInt32,
+                "seq_starts must be int32");
+  }
+
+  TORCH_CHECK(key_cache.device() == value_cache.device() &&
+                  key_cache.device() == dst_key.device() &&
+                  key_cache.device() == dst_value.device() &&
+                  key_cache.device() == block_table.device() &&
+                  key_cache.device() == cu_seq_lens.device(),
+              "all cp_gather_kv_cache tensors must be on the same device");
+  if (seq_starts.has_value()) {
+    TORCH_CHECK(key_cache.device() == seq_starts.value().device(),
+                "key_cache and seq_starts must be on the same device");
+  }
+
+  TORCH_CHECK(key_cache.dtype() == value_cache.dtype() &&
+                  key_cache.dtype() == dst_key.dtype() &&
+                  key_cache.dtype() == dst_value.dtype(),
+              "key/value caches and destinations must have the same dtype");
+  TORCH_CHECK(value_cache.size(1) == block_size,
+              "key and value caches must have the same block size");
+  TORCH_CHECK(value_cache.flatten(2, -1).size(2) == entry_size,
+              "key and value cache entries must have the same size");
+  TORCH_CHECK(dst_key.flatten(1, -1).size(1) == entry_size &&
+                  dst_value.flatten(1, -1).size(1) == entry_size,
+              "cache and destination entries must have the same size");
+
+  const int64_t block_table_stride = block_table.stride(0);
+  const int64_t key_block_stride = key_cache.stride(0);
+  const int64_t value_block_stride = value_cache.stride(0);
+  const int64_t key_entry_stride = key_cache.stride(1);
+  const int64_t value_entry_stride = value_cache.stride(1);
+  const int64_t dst_key_entry_stride = dst_key.stride(0);
+  const int64_t dst_value_entry_stride = dst_value.stride(0);
+
+  const int num_splits = batch_size > 128 ? 2 : batch_size > 64 ? 4 : 16;
+  const dim3 grid(batch_size, num_splits);
+  const dim3 block(1024);
+  const int dtype_bits = key_cache.element_size() * 8;
+  const int32_t* seq_starts_ptr =
+      seq_starts.has_value() ? seq_starts.value().data_ptr<int32_t>() : nullptr;
+
+  if (dtype_bits == 32) {
+    CALL_CP_GATHER_KV_CACHE(uint32_t);
+  } else if (dtype_bits == 16) {
+    CALL_CP_GATHER_KV_CACHE(uint16_t);
+  } else if (dtype_bits == 8) {
+    CALL_CP_GATHER_KV_CACHE(uint8_t);
   } else {
     TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
   }

@@ -779,17 +779,11 @@ class TritonAttentionImpl(AttentionImpl):
                 continue
             ws_k = ctx.workspace_k[:toks]
             ws_v = ctx.workspace_v[:toks]
-            ops.cp_gather_cache(
-                src_cache=key_cache,
-                dst=ws_k,
-                block_table=block_table,
-                cu_seq_lens=ctx.cu_seq_lens[i],
-                batch_size=num_reqs,
-                seq_starts=ctx.starts[i],
-            )
-            ops.cp_gather_cache(
-                src_cache=value_cache,
-                dst=ws_v,
+            ops.cp_gather_kv_cache(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                dst_key=ws_k,
+                dst_value=ws_v,
                 block_table=block_table,
                 cu_seq_lens=ctx.cu_seq_lens[i],
                 batch_size=num_reqs,
