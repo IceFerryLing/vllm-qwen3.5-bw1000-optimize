@@ -8,7 +8,7 @@ import torch
 import vllm._custom_ops as ops
 from tests.kernels.quant_utils import ref_dynamic_per_tensor_fp8_quant
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx950
+from vllm.platforms.rocm import on_gfx936, on_gfx950
 from vllm.utils.platform_utils import num_compute_units
 
 DTYPES = [torch.bfloat16, torch.float16]
@@ -223,6 +223,21 @@ def test_rocm_llmm_silu_mul_matches_unfused():
     ref_out = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
     out = ops.LLMM_SiluMul(weight, x)
 
+    torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not on_gfx936(), reason="solution index is specific to gfx936")
+@torch.inference_mode()
+def test_rocblas_bf16_mlp_down_4096_matches_default_solution():
+    torch.manual_seed(0)
+    x = torch.randn(4096, 17408, dtype=torch.bfloat16, device="cuda") * 0.02
+    weight = torch.randn(5120, 17408, dtype=torch.bfloat16, device="cuda") * 0.02
+
+    ref_out = torch.nn.functional.linear(x, weight)
+    out = ops.rocblas_bf16_mlp_down_4096(weight, x)
+
+    # Solution 20980 uses the same K reduction and BF16 output rounding as the
+    # default gfx936 solution for this shape.
     torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
 
 

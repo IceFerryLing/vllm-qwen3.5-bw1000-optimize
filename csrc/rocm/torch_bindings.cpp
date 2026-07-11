@@ -30,6 +30,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("LLMM_SiluMul(Tensor in_a, Tensor in_b) -> Tensor");
   rocm_ops.impl("LLMM_SiluMul", torch::kCUDA, &LLMM_SiluMul);
 
+  // Tuned rocBLAS solution for Qwen3.5-27B's 4096-token MLP down projection.
+  rocm_ops.def(
+      "rocblas_bf16_mlp_down_4096(Tensor weight, Tensor input) -> Tensor");
+  rocm_ops.impl("rocblas_bf16_mlp_down_4096", torch::kCUDA,
+                &rocblas_bf16_mlp_down_4096);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

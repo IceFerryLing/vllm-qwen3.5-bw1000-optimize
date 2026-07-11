@@ -2197,6 +2197,12 @@ def LLMM_SiluMul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.ops._rocm_C.LLMM_SiluMul(a, b)
 
 
+def rocblas_bf16_mlp_down_4096(
+    weight: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    return torch.ops._rocm_C.rocblas_bf16_mlp_down_4096(weight, x)
+
+
 def wvSplitK(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

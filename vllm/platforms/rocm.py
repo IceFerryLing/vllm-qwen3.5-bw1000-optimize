@@ -148,6 +148,7 @@ _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx936", "gfx942",
                                                 "gfx950"])
+_ON_GFX936 = "gfx936" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
 
@@ -233,6 +234,10 @@ def on_mi3xx() -> bool:
 
 def on_gfx9() -> bool:
     return _ON_GFX9
+
+
+def on_gfx936() -> bool:
+    return _ON_GFX936
 
 
 def on_gfx942() -> bool:

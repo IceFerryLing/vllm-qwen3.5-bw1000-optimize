@@ -10,6 +10,9 @@ torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
 
 torch::Tensor LLMM_SiluMul(at::Tensor& in_a, at::Tensor& in_b);
 
+torch::Tensor rocblas_bf16_mlp_down_4096(const at::Tensor& weight,
+                                         const at::Tensor& input);
+
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
                        const std::optional<at::Tensor>& in_bias,
                        const int64_t CuCount);

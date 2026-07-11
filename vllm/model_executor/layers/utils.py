@@ -142,13 +142,27 @@ def _use_strided_gemv(m: int, k: int) -> bool:
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx9, on_gfx950, on_mi3xx
+    from vllm.platforms.rocm import on_gfx9, on_gfx936, on_gfx950, on_mi3xx
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
     cu_count = num_compute_units()
+
+    if (
+        n == 4096
+        and on_gfx936()
+        and x.dim() == 2
+        and m == 5120
+        and k == 17408
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias is None
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        return ops.rocblas_bf16_mlp_down_4096(weight, x)
 
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()

@@ -1168,6 +1168,10 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   # _rocm_C extension
   #
+  find_library(VLLM_ROCBLAS_LIBRARY
+    NAMES rocblas
+    HINTS "${ROCM_PATH}/lib" "${ROCM_PATH}/lib64"
+    REQUIRED)
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
@@ -1180,6 +1184,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     SOURCES ${VLLM_ROCM_EXT_SRC}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
+    LIBRARIES ${VLLM_ROCBLAS_LIBRARY}
     USE_SABI 3
     WITH_SOABI)
 endif()

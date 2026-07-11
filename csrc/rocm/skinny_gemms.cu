@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <rocblas/rocblas.h>
 
 #include <stdexcept>
 #include <algorithm>
@@ -524,6 +525,59 @@ torch::Tensor LLMM_SiluMul(at::Tensor& in_a, at::Tensor& in_b) {
   LLGemmSiluMul_kernel<c10::BFloat16>
       <<<D, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, D, K);
   return out_c;
+}
+
+torch::Tensor rocblas_bf16_mlp_down_4096(const at::Tensor& weight,
+                                         const at::Tensor& input) {
+  constexpr int64_t N = 4096;
+  constexpr int64_t M = 5120;
+  constexpr int64_t K = 17408;
+  constexpr int32_t SOLUTION_INDEX = 20980;
+
+  TORCH_CHECK(input.dim() == 2 && input.size(0) == N && input.size(1) == K,
+              "input must have shape [4096, 17408]");
+  TORCH_CHECK(weight.dim() == 2 && weight.size(0) == M &&
+                  weight.size(1) == K,
+              "weight must have shape [5120, 17408]");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 &&
+                  weight.scalar_type() == torch::kBFloat16,
+              "rocblas_bf16_mlp_down_4096 requires BF16 tensors");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(),
+              "input and weight must be contiguous");
+  TORCH_CHECK(input.device() == weight.device(),
+              "input and weight must be on the same device");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto output = torch::empty(
+      {N, M}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+
+  // A rocBLAS handle is bound to a stream immediately before every call. Keep
+  // one handle per host thread so concurrent engine threads do not race while
+  // changing the current stream.
+  thread_local rocblas_handle handle = [] {
+    rocblas_handle value = nullptr;
+    const rocblas_status status = rocblas_create_handle(&value);
+    TORCH_CHECK(status == rocblas_status_success,
+                "rocblas_create_handle failed with status ", status);
+    return value;
+  }();
+  rocblas_status status = rocblas_set_stream(handle, stream);
+  TORCH_CHECK(status == rocblas_status_success,
+              "rocblas_set_stream failed with status ", status);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  status = rocblas_gemm_ex(
+      handle, rocblas_operation_transpose, rocblas_operation_none, M, N, K,
+      &alpha, weight.data_ptr(), rocblas_datatype_bf16_r, K, input.data_ptr(),
+      rocblas_datatype_bf16_r, K, &beta, output.data_ptr(),
+      rocblas_datatype_bf16_r, M, output.data_ptr(), rocblas_datatype_bf16_r,
+      M, rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index,
+      SOLUTION_INDEX, 0);
+  TORCH_CHECK(status == rocblas_status_success,
+              "rocblas_gemm_ex solution 20980 failed with status ", status);
+  return output;
 }
 
 #define DOT2C(V0, V2, V3)                                                     \
