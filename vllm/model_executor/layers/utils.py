@@ -246,6 +246,46 @@ direct_register_custom_op(
 )
 
 
+def rocm_unquantized_silu_mul_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    x_view = x.reshape(-1, x.size(-1))
+    if (
+        x_view.size(0) == 1
+        and x_view.size(1) == 5120
+        and weight.size(0) == 34816
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x_view.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        out = ops.LLMM_SiluMul(weight, x_view)
+    else:
+        gate_up = rocm_unquantized_gemm_impl(x_view, weight, None)
+        gate, up = gate_up.float().chunk(2, dim=-1)
+        out = (torch.nn.functional.silu(gate) * up).to(x.dtype)
+    return out.reshape(*x.shape[:-1], weight.size(0) // 2)
+
+
+def rocm_unquantized_silu_mul_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0] // 2))
+
+
+def rocm_unquantized_silu_mul(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return torch.ops.vllm.rocm_unquantized_silu_mul(x, weight)
+
+
+direct_register_custom_op(
+    op_name="rocm_unquantized_silu_mul",
+    op_func=rocm_unquantized_silu_mul_impl,
+    fake_impl=rocm_unquantized_silu_mul_fake,
+)
+
+
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return (
         torch._C._cpu._is_amx_tile_supported()

@@ -37,6 +37,7 @@ from vllm.config import (
 )
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.utils import rocm_unquantized_silu_mul
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -60,6 +62,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -108,6 +111,48 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+class Qwen3_5MLP(Qwen3NextMLP):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None,
+        enable_fused_decode: bool,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_act=hidden_act,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.use_rocm_fused_decode = (
+            enable_fused_decode
+            and current_platform.is_rocm()
+            and get_tensor_model_parallel_world_size() == 1
+            and quant_config is None
+            and hidden_size == 5120
+            and intermediate_size == 17408
+            and not self.act_fn.enabled()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.use_rocm_fused_decode
+            or x.numel() != 5120
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or self.gate_up_proj.weight.dtype != torch.bfloat16
+            or not self.gate_up_proj.weight.is_contiguous()
+        ):
+            return super().forward(x)
+        hidden = rocm_unquantized_silu_mul(x, self.gate_up_proj.weight)
+        hidden, _ = self.down_proj(hidden)
+        return hidden
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -269,11 +314,12 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3NextMLP(
+            self.mlp = Qwen3_5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                enable_fused_decode=vllm_config.lora_config is None,
                 prefix=f"{prefix}.mlp",
             )
         else:

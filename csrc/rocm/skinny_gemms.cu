@@ -377,6 +377,80 @@ __global__ void LLGemmStridedK_kernel(const scalar_t* in_a, const scalar_t* in_b
   }
 }
 
+// Fused Qwen3.5 gate_up GEMV and SwiGLU for N==1 BF16 decode. Each block
+// computes matching gate/up rows, which are separated by D rows in the merged
+// weight. Rounding is intentionally identical to Qwen3.5's Inductor-native
+// activation path: GEMV -> BF16, fused SiLU/multiply -> BF16.
+template <typename scalar_t>
+__global__ void LLGemmSiluMul_kernel(const scalar_t* in_a,
+                                     const scalar_t* in_b, scalar_t* out_c,
+                                     const int D, const int K) {
+  using scalar2_t = typename scalar2<scalar_t>::type;
+  auto af4 = reinterpret_cast<const float4*>(in_a);
+  auto bf4 = reinterpret_cast<const scalar2_t*>(in_b);
+  __shared__ float red_gate[WARP_SIZE + 1];
+  __shared__ float red_up[WARP_SIZE + 1];
+  const int K8 = K / 8;
+  const int row = blockIdx.x;
+  const int threadid = threadIdx.x;
+  const int warp = threadid / WARP_SIZE;
+  const int lane = threadid % WARP_SIZE;
+  const int num_warps = blockDim.x / WARP_SIZE;
+  float gate_acc = 0.f;
+  float up_acc = 0.f;
+
+  for (int kc = threadid; kc < K8; kc += blockDim.x) {
+    float4 gate_w = load_ntmprl(&af4[row * K8 + kc]);
+    float4 up_w = load_ntmprl(&af4[(row + D) * K8 + kc]);
+    auto gate_h2 = reinterpret_cast<scalar2_t*>(&gate_w);
+    auto up_h2 = reinterpret_cast<scalar2_t*>(&up_w);
+    scalar2_t b2[4] = {
+        bf4[kc * 4 + 0],
+        bf4[kc * 4 + 1],
+        bf4[kc * 4 + 2],
+        bf4[kc * 4 + 3],
+    };
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 gate_f = __bfloat1622float2(gate_h2[j]);
+      float2 up_f = __bfloat1622float2(up_h2[j]);
+      float2 x_f = __bfloat1622float2(b2[j]);
+      gate_acc = fmaf(gate_f.x, x_f.x, gate_acc);
+      gate_acc = fmaf(gate_f.y, x_f.y, gate_acc);
+      up_acc = fmaf(up_f.x, x_f.x, up_acc);
+      up_acc = fmaf(up_f.y, x_f.y, up_acc);
+    }
+  }
+
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+    gate_acc += __shfl_xor(gate_acc, mask);
+    up_acc += __shfl_xor(up_acc, mask);
+  }
+  if (lane == 0) {
+    red_gate[warp] = gate_acc;
+    red_up[warp] = up_acc;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    gate_acc = lane < num_warps ? red_gate[lane] : 0.f;
+    up_acc = lane < num_warps ? red_up[lane] : 0.f;
+    for (int mask = 16 / 2; mask >= 1; mask /= 2) {
+      gate_acc += __shfl_xor(gate_acc, mask);
+      up_acc += __shfl_xor(up_acc, mask);
+    }
+    if (lane == 0) {
+      scalar2_t rounded_gate_up =
+          __float22s2_rn<scalar2_t>(make_float2(gate_acc, up_acc));
+      float2 gate_up = __s22float2(rounded_gate_up);
+      float silu = gate_up.x / (1.f + expf(-gate_up.x));
+      scalar2_t rounded_out = __float22s2_rn<scalar2_t>(
+          make_float2(silu * gate_up.y, 0.f));
+      out_c[row] = reinterpret_cast<scalar_t*>(&rounded_out)[0];
+    }
+  }
+}
+
 torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
                             const int64_t rows_per_block) {
   auto M = in_a.size(0);
@@ -421,6 +495,34 @@ torch::Tensor LLMM_StridedK(at::Tensor& in_a, at::Tensor& in_b,
     }
   });
 
+  return out_c;
+}
+
+torch::Tensor LLMM_SiluMul(at::Tensor& in_a, at::Tensor& in_b) {
+  auto M = in_a.size(0);
+  auto K = in_a.size(1);
+  auto N = in_b.size(0);
+
+  TORCH_CHECK(N == 1, "Row number of activation tensor must be 1.");
+  TORCH_CHECK(in_a.dtype() == torch::kBFloat16 &&
+                  in_b.dtype() == torch::kBFloat16,
+              "LLMM_SiluMul currently supports BF16 only.");
+  TORCH_CHECK(M % 2 == 0, "Merged gate_up rows must be even.");
+  TORCH_CHECK(K == 5120,
+              "LLMM_SiluMul is tuned for Qwen3.5 hidden_size=5120.");
+
+  const int D = M / 2;
+  auto out_c = torch::empty(
+      {N, D}, torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int NUM_THREADS = 640;
+
+  auto a_ptr = in_a.data_ptr<c10::BFloat16>();
+  auto b_ptr = in_b.data_ptr<c10::BFloat16>();
+  auto c_ptr = out_c.data_ptr<c10::BFloat16>();
+  LLGemmSiluMul_kernel<c10::BFloat16>
+      <<<D, NUM_THREADS, 0, stream>>>(a_ptr, b_ptr, c_ptr, D, K);
   return out_c;
 }
 

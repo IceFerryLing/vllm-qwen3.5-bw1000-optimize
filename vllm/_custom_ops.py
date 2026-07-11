@@ -2193,6 +2193,10 @@ def LLMM_StridedK(
     return torch.ops._rocm_C.LLMM_StridedK(a, b, rows_per_block)
 
 
+def LLMM_SiluMul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.ops._rocm_C.LLMM_SiluMul(a, b)
+
+
 def wvSplitK(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

@@ -26,6 +26,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("LLMM_StridedK", torch::kCUDA, &LLMM_StridedK);
 
+  // Fused BF16 gate_up GEMV + SwiGLU for Qwen3.5 N==1 decode.
+  rocm_ops.def("LLMM_SiluMul(Tensor in_a, Tensor in_b) -> Tensor");
+  rocm_ops.impl("LLMM_SiluMul", torch::kCUDA, &LLMM_SiluMul);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

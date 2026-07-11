@@ -209,6 +209,23 @@ def test_rocm_llmm_strided_k_bf16_accuracy(k, m, rows_per_block):
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-3)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@torch.inference_mode()
+def test_rocm_llmm_silu_mul_matches_unfused():
+    torch.manual_seed(0)
+    k = 5120
+    d = 128
+    x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(2 * d, k, dtype=torch.bfloat16, device="cuda") * 0.02
+
+    gate_up = ops.LLMM_StridedK(weight, x, 2)
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    ref_out = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    out = ops.LLMM_SiluMul(weight, x)
+
+    torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("xnorm", [False, True])
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK)
 @pytest.mark.parametrize("dtype", DTYPES)
