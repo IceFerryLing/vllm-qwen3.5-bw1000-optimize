@@ -154,6 +154,20 @@ def rocm_unquantized_gemm_impl(
         n == 4096
         and on_gfx936()
         and x.dim() == 2
+        and m == 34816
+        and k == 5120
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias is None
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        return ops.rocblas_bf16_mlp_gate_up_4096(weight, x)
+
+    if (
+        n == 4096
+        and on_gfx936()
+        and x.dim() == 2
         and m == 5120
         and k == 17408
         and x.dtype == torch.bfloat16

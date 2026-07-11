@@ -241,6 +241,21 @@ def test_rocblas_bf16_mlp_down_4096_matches_default_solution():
     torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not on_gfx936(), reason="solution index is specific to gfx936")
+@torch.inference_mode()
+def test_rocblas_bf16_mlp_gate_up_4096_matches_default_solution():
+    torch.manual_seed(0)
+    x = torch.randn(4096, 5120, dtype=torch.bfloat16, device="cuda") * 0.02
+    weight = torch.randn(34816, 5120, dtype=torch.bfloat16, device="cuda") * 0.02
+
+    ref_out = torch.nn.functional.linear(x, weight)
+    out = ops.rocblas_bf16_mlp_gate_up_4096(weight, x)
+
+    # Solution 20981 preserves the default solution's K reduction and BF16
+    # output rounding for this fixed shape.
+    torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("xnorm", [False, True])
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK)
 @pytest.mark.parametrize("dtype", DTYPES)
