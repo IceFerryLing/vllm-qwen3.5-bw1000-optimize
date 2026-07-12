@@ -7,6 +7,10 @@ import torch
 
 import vllm._custom_ops as ops
 from tests.kernels.quant_utils import ref_dynamic_per_tensor_fp8_quant
+from vllm.model_executor.layers.utils import (
+    _strided_rows_per_block,
+    _use_strided_gemv,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx936, on_gfx950
 from vllm.utils.platform_utils import num_compute_units
@@ -72,7 +76,6 @@ N_FACTORS_WVSPLITKRC = [
 ]
 K_FACTORS_WVSPLITKRC = [2880, 2880 + 8, 3072, 3072 + 8]
 M_FACTORS_WVSPLITKRC = [128, 128 + 16, 256, 256 + 16, 640, 640 + 16]
-
 NKM_FACTORS_WVSPLITK_FP8 = [
     # FP8-specific cases with K % 16 == 0
     (1, 16, 16),
@@ -114,6 +117,16 @@ def pad_fp8(weight):
     import torch.nn.functional as F
 
     return F.pad(weight, (0, num_pad), "constant", 0)[..., :-num_pad]
+
+
+def test_qwen35_gfx936_bf16_gemv_routing():
+    assert _use_strided_gemv(248320, 5120, True)
+    assert _strided_rows_per_block(248320, 5120, True) == 2
+
+    # Do not change the generic large-vocabulary behavior on other devices,
+    # dtypes, or unrelated shapes.
+    assert not _use_strided_gemv(248320, 5120, False)
+    assert not _use_strided_gemv(131072, 4096, True)
 
 
 @pytest.mark.parametrize("xnorm", [False, True])

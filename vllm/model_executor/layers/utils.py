@@ -126,9 +126,9 @@ def _llmm1_rows_per_block(m: int, k: int) -> int:
 
 
 def _strided_rows_per_block(
-    m: int, k: int, use_qwen35_down_rows1: bool = False
+    m: int, k: int, use_qwen35_gfx936_bf16_tuning: bool = False
 ) -> int:
-    if use_qwen35_down_rows1 and m == 5120 and k == 17408:
+    if use_qwen35_gfx936_bf16_tuning and m == 5120 and k == 17408:
         return 1
     if k > 8192 and m % 8 == 0:
         return 8
@@ -137,10 +137,17 @@ def _strided_rows_per_block(
     return 2
 
 
-def _use_strided_gemv(m: int, k: int) -> bool:
-    # Large vocabulary projections are faster in rocBLAS on gfx936. The
-    # custom kernel targets the repeated decoder projections instead.
-    return m < 65536 and k % 8 == 0
+def _use_strided_gemv(
+    m: int, k: int, use_qwen35_gfx936_bf16_tuning: bool = False
+) -> bool:
+    # The generic large-vocabulary path remains excluded. Qwen3.5's exact
+    # gfx936 BF16 LM-head shape is an exception: rows=2 is faster than both
+    # LLMM1 and rocBLAS while also being substantially closer to rocBLAS than
+    # the current LLMM1 result.
+    use_qwen35_lm_head = (
+        use_qwen35_gfx936_bf16_tuning and m == 248320 and k == 5120
+    )
+    return (m < 65536 or use_qwen35_lm_head) and k % 8 == 0
 
 
 def rocm_unquantized_gemm_impl(
@@ -216,6 +223,7 @@ def rocm_unquantized_gemm_impl(
         return torch.nn.functional.linear(x, weight, bias)
 
     x_view = x.reshape(-1, x.size(-1))
+    use_qwen35_gfx936_bf16_tuning = on_gfx936() and x.dtype == torch.bfloat16
     if m > 8 and 0 < n <= 4 and on_mi3xx():
         # wvSplitK relies on v_dot2c_f32_f16 / MFMA instructions only
         # available on MI3XX (gfx942/gfx950); skip on gfx936.
@@ -227,7 +235,7 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and bias is None
         and envs.VLLM_ROCM_STRIDED_GEMV
-        and _use_strided_gemv(m, k)
+        and _use_strided_gemv(m, k, use_qwen35_gfx936_bf16_tuning)
     ):
         # Strided-K GEMV: higher/steadier HBM bandwidth on selected gfx936 decode
         # shapes. It grid-strides the K reduction, so it also handles large K
@@ -238,7 +246,7 @@ def rocm_unquantized_gemm_impl(
             weight,
             x_view,
             _strided_rows_per_block(
-                m, k, on_gfx936() and x.dtype == torch.bfloat16
+                m, k, use_qwen35_gfx936_bf16_tuning
             ),
         )
         return out.reshape(*x.shape[:-1], weight.shape[0])
