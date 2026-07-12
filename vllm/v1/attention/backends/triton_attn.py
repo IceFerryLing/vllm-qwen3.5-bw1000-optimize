@@ -40,11 +40,25 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# route the Qwen3.5 full-attention (DECODER) prefill path to
-# non-paged flash_attn (gather history KV -> contiguous, per-segment FA + merge),
-# bypassing the numerically-broken paged FA kernel on gfx936.
+# Route the Qwen3.5 full-attention prefill path to non-paged flash_attn. The
+# single-request fast path maintains a contiguous KV mirror; other batches use
+# gathered history plus per-segment FA and merge. This bypasses the
+# numerically-broken paged FA kernel on gfx936.
 #  Default on; set VLLM_TRITON_FA_PREFILL=0 to fall back to pure Triton.
 VLLM_TRITON_FA_PREFILL = int(os.environ.get("VLLM_TRITON_FA_PREFILL", "1"))
+FA_PREFILL_MIRROR_CAPACITY = int(
+    os.environ.get("VLLM_TRITON_FA_PREFILL_MIRROR_CAPACITY", str(32 * 1024))
+)
+FA_PREFILL_FULL_KV_THRESHOLD = int(
+    os.environ.get("VLLM_TRITON_FA_PREFILL_FULL_KV_THRESHOLD", str(30 * 1024))
+)
+if FA_PREFILL_MIRROR_CAPACITY <= 0:
+    raise ValueError("VLLM_TRITON_FA_PREFILL_MIRROR_CAPACITY must be positive")
+if not 0 < FA_PREFILL_FULL_KV_THRESHOLD <= FA_PREFILL_MIRROR_CAPACITY:
+    raise ValueError(
+        "VLLM_TRITON_FA_PREFILL_FULL_KV_THRESHOLD must be positive and no "
+        "larger than VLLM_TRITON_FA_PREFILL_MIRROR_CAPACITY"
+    )
 
 # Plain upstream flash_attn (NOT aiter, NOT vllm.vllm_flash_attn). aiter FA is
 # import-broken and vllm_flash_attn is unavailable on this ROCm build.
@@ -95,6 +109,15 @@ class TritonChunkedContextMetadata:
 
 
 @dataclass
+class TritonFAPrefillMirror:
+    capacity: int
+    full_kv_threshold: int
+    layer_k: dict[str, torch.Tensor]
+    layer_v: dict[str, torch.Tensor]
+    layer_lens: dict[str, int]
+
+
+@dataclass
 class TritonAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
@@ -136,6 +159,11 @@ class TritonAttentionMetadata:
     # prefill on an empty cache).
     use_fa_prefill: bool = False
     chunked_context: TritonChunkedContextMetadata | None = None
+    fa_prefill_mirror: TritonFAPrefillMirror | None = None
+    fa_prefill_single_context_len: int | None = None
+    fa_prefill_single_seq_len: int | None = None
+    fa_prefill_single_context_start_loc: torch.Tensor | None = None
+    fa_prefill_single_seq_start_loc: torch.Tensor | None = None
 
     @property
     def mm_prefix_range_tensor(self) -> torch.Tensor | None:
@@ -259,6 +287,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         )
         self.chunked_prefill_workspace_k = None
         self.chunked_prefill_workspace_v = None
+        self.fa_prefill_mirror = None
+        self.fa_prefill_mirror_active = False
         if self.fa_prefill_enabled:
             model_config = vllm_config.model_config
             scheduler_config = vllm_config.scheduler_config
@@ -286,9 +316,43 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 device=device,
             )
 
+            # Qwen3.5-27B has 16 full-attention layers with this exact GQA
+            # shape. Keeping a per-layer contiguous KV mirror removes repeated
+            # paged-cache gathers across 4K prefill chunks. Allocate it here so
+            # KV-cache memory profiling accounts for the extra storage.
+            if (
+                self.num_heads_q == 24
+                and self.num_heads_kv == 4
+                and self.headdim == 256
+            ):
+                mirror_capacity = min(
+                    model_config.max_model_len, FA_PREFILL_MIRROR_CAPACITY
+                )
+                layer_k = {
+                    name: torch.empty(
+                        (mirror_capacity, self.num_heads_kv, self.headdim),
+                        dtype=kv_cache_dtype,
+                        device=device,
+                    )
+                    for name in layer_names
+                }
+                layer_v = {
+                    name: torch.empty_like(layer_k[name]) for name in layer_names
+                }
+                self.fa_prefill_mirror = TritonFAPrefillMirror(
+                    capacity=mirror_capacity,
+                    full_kv_threshold=min(
+                        FA_PREFILL_FULL_KV_THRESHOLD, mirror_capacity
+                    ),
+                    layer_k=layer_k,
+                    layer_v=layer_v,
+                    layer_lens=dict.fromkeys(layer_names, -1),
+                )
+
     def _build_chunked_context(
         self,
-        common_attn_metadata: CommonAttentionMetadata,
+        seq_lens_cpu: torch.Tensor,
+        query_lens_cpu: torch.Tensor,
     ) -> "TritonChunkedContextMetadata | None":
         """
         The Triton backend does NOT reorder the batch (no decodes-first
@@ -297,9 +361,6 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         requests contribute 0 and are harmless. Returns None if no request has
         any context (pure prefill with empty cache).
         """
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
-        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         context_lens_cpu = (seq_lens_cpu - query_lens_cpu).to(torch.int32)
         num_reqs = context_lens_cpu.shape[0]
         max_context_len = int(context_lens_cpu.max().item())
@@ -379,11 +440,47 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # FA-prefill path: active only when this step carries prefill queries
         # (max_query_len > 1). Pure-decode steps keep the tuned Triton path.
         chunked_context = None
+        fa_prefill_single_context_len = None
+        fa_prefill_single_seq_len = None
+        fa_prefill_single_context_start_loc = None
+        fa_prefill_single_seq_start_loc = None
         use_fa_prefill = (
             self.fa_prefill_enabled and max_query_len > 1 and not use_cascade
         )
         if use_fa_prefill:
-            chunked_context = self._build_chunked_context(common_attn_metadata)
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens_cpu = (
+                query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            )
+            seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+            chunked_context = self._build_chunked_context(
+                seq_lens_cpu, query_lens_cpu
+            )
+            if query_start_loc_cpu.shape[0] == 2:
+                query_len = int(query_lens_cpu[0].item())
+                fa_prefill_single_seq_len = int(seq_lens_cpu[0].item())
+                fa_prefill_single_context_len = (
+                    fa_prefill_single_seq_len - query_len
+                )
+                fa_prefill_single_context_start_loc = torch.tensor(
+                    [0, fa_prefill_single_context_len],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                fa_prefill_single_seq_start_loc = torch.tensor(
+                    [0, fa_prefill_single_seq_len],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+
+        mirror_batch_active = (
+            use_fa_prefill and fa_prefill_single_context_len is not None
+        )
+        if self.fa_prefill_mirror is not None:
+            if not mirror_batch_active and self.fa_prefill_mirror_active:
+                for name in self.fa_prefill_mirror.layer_lens:
+                    self.fa_prefill_mirror.layer_lens[name] = -1
+            self.fa_prefill_mirror_active = mirror_batch_active
 
         if use_cascade:
             cu_prefix_query_lens = torch.tensor(
@@ -421,6 +518,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_expsum=self.softmax_segm_expsum,
             use_fa_prefill=use_fa_prefill,
             chunked_context=chunked_context,
+            fa_prefill_mirror=self.fa_prefill_mirror,
+            fa_prefill_single_context_len=fa_prefill_single_context_len,
+            fa_prefill_single_seq_len=fa_prefill_single_seq_len,
+            fa_prefill_single_context_start_loc=(
+                fa_prefill_single_context_start_loc
+            ),
+            fa_prefill_single_seq_start_loc=fa_prefill_single_seq_start_loc,
         )
         return attn_metadata
 
@@ -685,6 +789,7 @@ class TritonAttentionImpl(AttentionImpl):
                 value_cache=value_cache,
                 output=output[:num_actual_tokens],
                 attn_metadata=attn_metadata,
+                layer_name=layer.layer_name,
             )
             return output
 
@@ -731,6 +836,7 @@ class TritonAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: "TritonAttentionMetadata",
+        layer_name: str,
     ) -> None:
         """Non-paged flash_attn for the full-attention prefill path.
 
@@ -739,9 +845,23 @@ class TritonAttentionImpl(AttentionImpl):
             the paged cache by the earlier kv-cache-update op).
         key_cache/value_cache: paged cache [num_blocks, block_size, kv_heads, hd].
 
-        Computes, per request: attention over new tokens (causal) merged with
-        attention over gathered history (non-causal). Mathematically exact.
+        For Qwen3.5-27B prefill, keep an incremental contiguous
+        KV mirror. Short and medium contexts use one full-KV causal FA; long
+        contexts retain split FA but read history from the mirror. Other cases
+        use the general gather-and-merge path below.
         """
+        if self._forward_fa_prefill_mirror(
+            query=query,
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=output,
+            attn_metadata=attn_metadata,
+            layer_name=layer_name,
+        ):
+            return
+
         cu_seqlens_q = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
 
@@ -836,6 +956,146 @@ class TritonAttentionImpl(AttentionImpl):
             suffix_output=suffix_output,
             suffix_lse=suffix_lse,
         )
+
+    def _forward_fa_prefill_mirror(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: "TritonAttentionMetadata",
+        layer_name: str,
+    ) -> bool:
+        mirror = attn_metadata.fa_prefill_mirror
+        context_len = attn_metadata.fa_prefill_single_context_len
+        seq_len = attn_metadata.fa_prefill_single_seq_len
+        if (
+            mirror is None
+            or context_len is None
+            or seq_len is None
+            or layer_name not in mirror.layer_k
+            or seq_len > mirror.capacity
+            or key.shape[0] != seq_len - context_len
+        ):
+            if mirror is not None and layer_name in mirror.layer_lens:
+                mirror.layer_lens[layer_name] = -1
+            return False
+
+        mirror_k = mirror.layer_k[layer_name]
+        mirror_v = mirror.layer_v[layer_name]
+        mirrored_len = mirror.layer_lens[layer_name]
+
+        if context_len == 0:
+            mirrored_len = 0
+        elif mirrored_len != context_len:
+            ctx = attn_metadata.chunked_context
+            if ctx is None:
+                mirror.layer_lens[layer_name] = -1
+                return False
+
+            copied = 0
+            for i, toks in enumerate(ctx.seq_tot):
+                if toks == 0:
+                    continue
+                end = copied + toks
+                ops.cp_gather_cache(
+                    src_cache=key_cache,
+                    dst=mirror_k[copied:end],
+                    block_table=attn_metadata.block_table,
+                    cu_seq_lens=ctx.cu_seq_lens[i],
+                    batch_size=1,
+                    seq_starts=ctx.starts[i],
+                )
+                ops.cp_gather_cache(
+                    src_cache=value_cache,
+                    dst=mirror_v[copied:end],
+                    block_table=attn_metadata.block_table,
+                    cu_seq_lens=ctx.cu_seq_lens[i],
+                    batch_size=1,
+                    seq_starts=ctx.starts[i],
+                )
+                copied = end
+            if copied != context_len:
+                mirror.layer_lens[layer_name] = -1
+                return False
+            mirrored_len = copied
+
+        end = mirrored_len + key.shape[0]
+        if end != seq_len:
+            mirror.layer_lens[layer_name] = -1
+            return False
+        mirror_k[mirrored_len:end].copy_(key)
+        mirror_v[mirrored_len:end].copy_(value)
+        mirror.layer_lens[layer_name] = end
+
+        cu_seqlens_q = attn_metadata.query_start_loc
+        max_seqlen_q = attn_metadata.max_query_len
+        if context_len == 0:
+            out = _fa_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_q,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            output.copy_(out.view(output.shape))
+            return True
+
+        if seq_len <= mirror.full_kv_threshold:
+            assert attn_metadata.fa_prefill_single_seq_start_loc is not None
+            out = _fa_varlen_func(
+                q=query,
+                k=mirror_k[:seq_len],
+                v=mirror_v[:seq_len],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.fa_prefill_single_seq_start_loc,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            output.copy_(out.view(output.shape))
+            return True
+
+        suffix_output, suffix_lse = _fa_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=True,
+            return_attn_probs=True,
+        )[:2]
+        assert attn_metadata.fa_prefill_single_context_start_loc is not None
+        prefix_output, prefix_lse = _fa_varlen_func(
+            q=query,
+            k=mirror_k[:context_len],
+            v=mirror_v[:context_len],
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.fa_prefill_single_context_start_loc,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=context_len,
+            softmax_scale=self.scale,
+            causal=False,
+            return_attn_probs=True,
+        )[:2]
+        merge_attn_states(
+            output=output.view(suffix_output.shape),
+            prefix_output=prefix_output,
+            prefix_lse=prefix_lse,
+            suffix_output=suffix_output,
+            suffix_lse=suffix_lse,
+        )
+        return True
 
     def _forward_encoder_attention(
         self,
