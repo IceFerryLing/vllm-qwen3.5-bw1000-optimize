@@ -36,6 +36,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("rocblas_bf16_mlp_down_4096", torch::kCUDA,
                 &rocblas_bf16_mlp_down_4096);
 
+  // Tuned rocBLAS solution for Qwen3.5-27B's 4096-token MLP gate_up projection.
+  rocm_ops.def(
+      "rocblas_bf16_mlp_gate_up_4096(Tensor weight, Tensor input) -> Tensor");
+  rocm_ops.impl("rocblas_bf16_mlp_gate_up_4096", torch::kCUDA,
+                &rocblas_bf16_mlp_gate_up_4096);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

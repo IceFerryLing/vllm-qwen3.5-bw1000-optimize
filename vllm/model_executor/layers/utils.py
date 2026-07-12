@@ -150,6 +150,42 @@ def _use_strided_gemv(
     return (m < 65536 or use_qwen35_lm_head) and k % 8 == 0
 
 
+def _use_qwen35_gate_up_4096(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    from vllm.platforms.rocm import on_gfx936
+
+    return (
+        on_gfx936()
+        and x.dim() == 2
+        and x.shape == (4096, 5120)
+        and weight.shape == (34816, 5120)
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias is None
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def _use_qwen35_down_4096(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    from vllm.platforms.rocm import on_gfx936
+
+    return (
+        on_gfx936()
+        and x.dim() == 2
+        and x.shape == (4096, 17408)
+        and weight.shape == (5120, 17408)
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias is None
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -159,21 +195,13 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     k = weight.shape[1]
 
-    cu_count = num_compute_units()
+    if _use_qwen35_gate_up_4096(x, weight, bias):
+        return ops.rocblas_bf16_mlp_gate_up_4096(weight, x)
 
-    if (
-        n == 4096
-        and on_gfx936()
-        and x.dim() == 2
-        and m == 5120
-        and k == 17408
-        and x.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
-        and bias is None
-        and x.is_contiguous()
-        and weight.is_contiguous()
-    ):
+    if _use_qwen35_down_4096(x, weight, bias):
         return ops.rocblas_bf16_mlp_down_4096(weight, x)
+
+    cu_count = num_compute_units()
 
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()
