@@ -720,11 +720,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         When the first real inference triggers the autotuner it OOMs
         because there is not enough memory left for benchmarking.
 
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` with small dummy tensors to force
-        autotuning while GPU memory is still plentiful.  The autotuner
-        results are cached globally, so only the first layer incurs
-        actual benchmarking cost.
+        This method runs minimal forward passes through the prefill gating and
+        ``chunk_gated_delta_rule`` kernels while GPU memory is still plentiful.
+        The compiled results are cached globally, so only the first layer
+        incurs actual compilation or autotuning cost.
 
         Most kernels use a fixed ``BT = chunk_size`` (64), but
         ``chunk_fwd_kernel_o`` recomputes ``BT`` from the sequence
@@ -762,6 +761,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             (16, None, False),
             (32, None, False),
             (64, None, False),
+            (64, None, True),
         ]
         if profile_nt > 1 and has_gdn_workload_bucket_config(
             H=num_v_heads,
@@ -782,8 +782,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             v = torch.randn(
                 1, T, num_v_heads, self.head_v_dim, device=device, dtype=dtype
             )
-            g = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
-            beta = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
+            a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+            b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
             state = torch.zeros(
                 1,
                 num_v_heads,
@@ -792,7 +793,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 device=device,
                 dtype=state_dtype,
             )
-            cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.long)
+            cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
 
             try:
                 self.chunk_gated_delta_rule(
@@ -826,7 +827,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     self.prefix,
                 )
             finally:
-                del q, k, v, g, beta, state, cu_seqlens
+                del q, k, v, a, b, g, beta, state, cu_seqlens
 
         torch.accelerator.empty_cache()
 
