@@ -15,6 +15,7 @@ from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
+from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
@@ -33,12 +34,30 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     out: torch.Tensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
+    )
+    g = chunk_local_cumsum(
+        g,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        k=k,
+        beta=beta,
+        g=g,
+        cu_seqlens=cu_seqlens,
+        output_dtype=torch.float32,
+        chunk_indices=chunk_indices,
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+    A = solve_tril(
+        A=A,
+        cu_seqlens=cu_seqlens,
+        output_dtype=k.dtype,
+        chunk_indices=chunk_indices,
+    )
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -46,6 +65,7 @@ def chunk_gated_delta_rule_fwd(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -55,6 +75,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     o = chunk_fwd_o(
         q=q,
@@ -65,6 +86,7 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         out=out,
+        chunk_indices=(chunk_indices if q.shape[1] >= 64 else None),
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None

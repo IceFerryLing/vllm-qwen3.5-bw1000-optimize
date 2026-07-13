@@ -14,7 +14,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import use_cuda_graph, use_qwen35_gdn_prefill_tuning
+from .utils import get_gfx936_gdn_h_config, use_cuda_graph
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -290,6 +290,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -297,11 +298,8 @@ def chunk_gated_delta_rule_fwd_h(
     H = u.shape[-2]
     BT = chunk_size
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
@@ -339,18 +337,20 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
     )
-    if use_qwen35_gdn_prefill_tuning(H, K, V, BT):
-        _chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, 32), N * H)](
+    gfx936_config = get_gfx936_gdn_h_config(H, K, V, BT, NT)
+    if gfx936_config is not None:
+        BV, num_warps, num_stages = gfx936_config
+        _chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, BV), N * H)](
             **kernel_args,
-            BV=32,
+            BV=BV,
             USE_G=g is not None,
             USE_GK=gk is not None,
             USE_INITIAL_STATE=initial_state is not None,
             STORE_FINAL_STATE=final_state is not None,
             SAVE_NEW_VALUE=v_new is not None,
             IS_VARLEN=cu_seqlens is not None,
-            num_warps=8,
-            num_stages=1,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
 

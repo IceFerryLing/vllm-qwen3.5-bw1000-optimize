@@ -164,8 +164,39 @@ is_tma_supported = (is_nvidia and torch.cuda.get_device_capability(0)[0] >= 9) a
 )
 
 
-def use_qwen35_gdn_prefill_tuning(H: int, K: int, V: int, BT: int) -> bool:
-    return is_amd_gfx936 and (H, K, V, BT) == (48, 128, 128, 64)
+def get_gfx936_gdn_h_config(
+    H: int, K: int, V: int, BT: int, NT: int
+) -> tuple[int, int, int] | None:
+    if not is_amd_gfx936 or BT != 64 or K != 128 or V != 128:
+        return None
+    if NT >= 16 and H >= 32:
+        return 32, 8, 1
+    if NT >= 32 and H >= 24:
+        return 16, 4, 1
+    return None
+
+
+def get_gfx936_gdn_o_config(
+    H: int, K: int, V: int, BT: int, NT: int
+) -> tuple[int, int, int, int] | None:
+    if (
+        not is_amd_gfx936
+        or BT != 64
+        or NT < 32
+        or K not in (128, 256)
+        or V not in (128, 256)
+        or (H < 24 and K < 256 and V < 256)
+    ):
+        return None
+    return 32, 128, 2, 1
+
+
+def get_gfx936_gdn_recompute_config(
+    K: int, V: int, BT: int, NT: int
+) -> tuple[int, int, int, int] | None:
+    if not is_amd_gfx936 or BT != 64 or NT < 16 or K not in (128, 256) or V != 128:
+        return None
+    return 64, 128, 2, 2
 
 
 def get_all_max_shared_mem():

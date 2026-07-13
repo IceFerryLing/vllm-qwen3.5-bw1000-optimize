@@ -19,8 +19,8 @@ from .op import exp
 from .utils import (
     FLA_GDN_FIX_BT,
     check_shared_mem,
+    get_gfx936_gdn_o_config,
     is_nvidia_hopper,
-    use_qwen35_gdn_prefill_tuning,
 )
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -160,13 +160,13 @@ def chunk_fwd_o(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     out: torch.Tensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = 64 if FLA_GDN_FIX_BT else min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -184,8 +184,10 @@ def chunk_fwd_o(
         o = out
 
     args = (q, k, v, h, g, o, cu_seqlens, chunk_indices, scale)
-    if use_qwen35_gdn_prefill_tuning(H, K, V, BT):
-        _chunk_fwd_kernel_o[(1, NT, B * H)](
+    gfx936_config = get_gfx936_gdn_o_config(H, K, V, BT, NT)
+    if gfx936_config is not None:
+        BK, BV, num_warps, num_stages = gfx936_config
+        _chunk_fwd_kernel_o[(triton.cdiv(V, BV), NT, B * H)](
             *args,
             T=T,
             H=H,
@@ -193,12 +195,12 @@ def chunk_fwd_o(
             K=K,
             V=V,
             BT=BT,
-            BK=32,
-            BV=128,
+            BK=BK,
+            BV=BV,
             USE_G=g is not None,
             IS_VARLEN=cu_seqlens is not None,
-            num_warps=2,
-            num_stages=1,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
 

@@ -14,7 +14,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .utils import use_qwen35_gdn_prefill_tuning
+from .utils import get_gfx936_gdn_recompute_config
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -129,17 +129,17 @@ def recompute_w_u_fwd(
     g_cumsum: torch.Tensor,
     A: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if cu_seqlens is not None and chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 128 if use_qwen35_gdn_prefill_tuning(H, K, V, BT) else 64
+    gfx936_config = get_gfx936_gdn_recompute_config(K, V, BT, NT)
+    BK, BV = gfx936_config[:2] if gfx936_config is not None else (64, 64)
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     kernel_args = dict(
@@ -161,12 +161,13 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
     )
-    if use_qwen35_gdn_prefill_tuning(H, K, V, BT):
+    if gfx936_config is not None:
+        _, _, num_warps, num_stages = gfx936_config
         _recompute_w_u_fwd_kernel[(NT, B * H)](
             **kernel_args,
             IS_VARLEN=cu_seqlens is not None,
-            num_warps=2,
-            num_stages=2,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
         recompute_w_u_fwd_kernel[(NT, B * H)](**kernel_args)

@@ -540,9 +540,11 @@ class OlmoHybridGatedDeltaNet(nn.Module, MambaBase):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
+        direct_prefill_out = False
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
+            direct_prefill_out = spec_sequence_masks is None
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -556,6 +558,11 @@ class OlmoHybridGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 use_qk_l2norm_in_kernel=True,
+                out=(
+                    core_attn_out[:num_actual_tokens].unsqueeze(0)
+                    if direct_prefill_out
+                    else None
+                ),
             )
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
@@ -591,7 +598,7 @@ class OlmoHybridGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
+        elif not direct_prefill_out:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
 
