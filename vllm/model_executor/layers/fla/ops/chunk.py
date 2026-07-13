@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     out: torch.Tensor | None = None,
+    tuning_nt: int | None = None,
 ):
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
@@ -66,6 +67,7 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        tuning_nt=tuning_nt,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -76,6 +78,7 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        tuning_nt=tuning_nt,
     )
     o = chunk_fwd_o(
         q=q,
@@ -87,6 +90,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         out=out,
         chunk_indices=(chunk_indices if q.shape[1] >= 64 else None),
+        tuning_nt=tuning_nt,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -110,6 +114,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        tuning_nt: int | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -125,6 +130,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            tuning_nt=tuning_nt,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -144,6 +150,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     out: torch.Tensor | None = None,
+    tuning_nt: int | None = None,
 ):
     r"""
     Args:
@@ -247,6 +254,7 @@ def chunk_gated_delta_rule(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             out=out,
+            tuning_nt=tuning_nt,
         )
         return o.to(q.dtype), final_state
 
@@ -261,5 +269,6 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        tuning_nt,
     )
     return o, final_state

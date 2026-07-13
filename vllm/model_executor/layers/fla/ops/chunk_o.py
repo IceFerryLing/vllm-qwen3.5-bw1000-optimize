@@ -161,6 +161,7 @@ def chunk_fwd_o(
     chunk_size: int = 64,
     out: torch.Tensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    tuning_nt: int | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -184,7 +185,9 @@ def chunk_fwd_o(
         o = out
 
     args = (q, k, v, h, g, o, cu_seqlens, chunk_indices, scale)
-    gfx936_config = get_gfx936_gdn_o_config(H, K, V, BT, NT)
+    gfx936_config = get_gfx936_gdn_o_config(
+        H, K, V, BT, tuning_nt if tuning_nt is not None else NT
+    )
     if gfx936_config is not None:
         BK, BV, num_warps, num_stages = gfx936_config
         _chunk_fwd_kernel_o[(triton.cdiv(V, BV), NT, B * H)](

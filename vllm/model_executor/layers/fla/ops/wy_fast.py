@@ -130,6 +130,7 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
     chunk_indices: torch.LongTensor | None = None,
+    tuning_nt: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -138,7 +139,9 @@ def recompute_w_u_fwd(
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    gfx936_config = get_gfx936_gdn_recompute_config(K, V, BT, NT)
+    gfx936_config = get_gfx936_gdn_recompute_config(
+        K, V, BT, tuning_nt if tuning_nt is not None else NT
+    )
     BK, BV = gfx936_config[:2] if gfx936_config is not None else (64, 64)
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)

@@ -291,6 +291,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    tuning_nt: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -337,7 +338,9 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
     )
-    gfx936_config = get_gfx936_gdn_h_config(H, K, V, BT, NT)
+    gfx936_config = get_gfx936_gdn_h_config(
+        H, K, V, BT, tuning_nt if tuning_nt is not None else NT
+    )
     if gfx936_config is not None:
         BV, num_warps, num_stages = gfx936_config
         _chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, BV), N * H)](

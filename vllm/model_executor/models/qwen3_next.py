@@ -39,6 +39,9 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
+from vllm.model_executor.layers.fla.ops.utils import (
+    has_gdn_workload_bucket_config,
+)
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
@@ -119,6 +122,7 @@ def fi_chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     out: torch.Tensor | None = None,
+    tuning_nt: int | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -222,6 +226,7 @@ class ChunkGatedDeltaRule(CustomOp):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         out: torch.Tensor | None = None,
+        tuning_nt: int | None = None,
     ):
         return fi_chunk_gated_delta_rule(
             q=q,
@@ -234,6 +239,7 @@ class ChunkGatedDeltaRule(CustomOp):
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             out=out,
+            tuning_nt=tuning_nt,
         )
 
     def forward_native(
@@ -248,6 +254,7 @@ class ChunkGatedDeltaRule(CustomOp):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         out: torch.Tensor | None = None,
+        tuning_nt: int | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -260,6 +267,7 @@ class ChunkGatedDeltaRule(CustomOp):
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             out=out,
+            tuning_nt=tuning_nt,
         )
 
 
@@ -724,6 +732,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         is part of its autotune key, we run warmup passes with T = 16,
         32, and 64 to cover all possible ``BT`` values.
 
+        Long-context gfx936 configs also depend on the number of chunks.
+        The profile buffer describes the largest scheduler workload, so a
+        final small-T pass selects that workload bucket without allocating
+        full-length dummy tensors. It also stores final state to compile the
+        specialization used by real prefills.
+
         The decode path uses ``fused_sigmoid_gating_delta_rule_update``
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
@@ -740,9 +754,25 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # Run warmup for each possible BT value of chunk_fwd_kernel_o:
         #   T=16 → BT=16, T=32 → BT=32, T=64 → BT=64.
-        # Other kernels always use BT=chunk_size(64), so their autotune
-        # cache is populated on the first pass and reused thereafter.
-        for T in (16, 32, 64):
+        # Then compile the workload bucket represented by the profile buffer
+        # with a small tensor; T is deliberately not specialized by these
+        # kernels, while tuning_nt only affects config selection.
+        profile_nt = max(1, (mixed_qkv.shape[0] + 63) // 64)
+        warmup_specs: list[tuple[int, int | None, bool]] = [
+            (16, None, False),
+            (32, None, False),
+            (64, None, False),
+        ]
+        if profile_nt > 1 and has_gdn_workload_bucket_config(
+            H=num_v_heads,
+            K=self.head_k_dim,
+            V=self.head_v_dim,
+            BT=64,
+            NT=profile_nt,
+        ):
+            warmup_specs.append((64, profile_nt, True))
+
+        for T, tuning_nt, output_final_state in warmup_specs:
             q = torch.randn(
                 1, T, num_k_heads, self.head_k_dim, device=device, dtype=dtype
             )
@@ -772,23 +802,27 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     g=g,
                     beta=beta,
                     initial_state=state,
-                    output_final_state=False,
+                    output_final_state=output_final_state,
                     cu_seqlens=cu_seqlens,
                     use_qk_l2norm_in_kernel=True,
+                    tuning_nt=tuning_nt,
                 )
             except Exception:
                 logger.warning(
-                    "GDN prefill kernel warmup (T=%d) failed for "
+                    "GDN prefill kernel warmup (T=%d, tuning_nt=%s) failed for "
                     "layer %s. First inference may OOM due to "
                     "autotuner.",
                     T,
+                    tuning_nt,
                     self.prefix,
                     exc_info=True,
                 )
             else:
                 logger.debug(
-                    "GDN prefill kernel warmup (T=%d) completed for layer %s",
+                    "GDN prefill kernel warmup (T=%d, tuning_nt=%s) "
+                    "completed for layer %s",
                     T,
+                    tuning_nt,
                     self.prefix,
                 )
             finally:

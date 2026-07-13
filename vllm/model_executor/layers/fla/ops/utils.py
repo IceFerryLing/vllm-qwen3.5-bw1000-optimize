@@ -199,6 +199,17 @@ def get_gfx936_gdn_recompute_config(
     return 64, 128, 2, 2
 
 
+def has_gdn_workload_bucket_config(H: int, K: int, V: int, BT: int, NT: int) -> bool:
+    return any(
+        config is not None
+        for config in (
+            get_gfx936_gdn_h_config(H, K, V, BT, NT),
+            get_gfx936_gdn_o_config(H, K, V, BT, NT),
+            get_gfx936_gdn_recompute_config(K, V, BT, NT),
+        )
+    )
+
+
 def get_all_max_shared_mem():
     try:
         return [
