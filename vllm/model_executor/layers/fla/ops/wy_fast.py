@@ -14,19 +14,11 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+from .utils import use_qwen35_gdn_prefill_tuning
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
+def _recompute_w_u_fwd_kernel(
     k,
     v,
     beta,
@@ -116,6 +108,20 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+recompute_w_u_fwd_kernel = triton.heuristics(
+    {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
+)(
+    triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ],
+        key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    )(_recompute_w_u_fwd_kernel)
+)
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -133,10 +139,10 @@ def recompute_w_u_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
-    BV = 64
+    BV = 128 if use_qwen35_gdn_prefill_tuning(H, K, V, BT) else 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    kernel_args = dict(
         k=k,
         v=v,
         beta=beta,
@@ -155,4 +161,13 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
     )
+    if use_qwen35_gdn_prefill_tuning(H, K, V, BT):
+        _recompute_w_u_fwd_kernel[(NT, B * H)](
+            **kernel_args,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=2,
+            num_stages=2,
+        )
+    else:
+        recompute_w_u_fwd_kernel[(NT, B * H)](**kernel_args)
     return w, u

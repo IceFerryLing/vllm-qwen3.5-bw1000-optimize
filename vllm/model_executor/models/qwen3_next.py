@@ -118,6 +118,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    out: torch.Tensor | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -152,9 +153,17 @@ def fi_chunk_gated_delta_rule(
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     if output_final_state:
         output, final_state = result
-        return output.unsqueeze(0), final_state
+        output = output.unsqueeze(0)
+        if out is not None:
+            out.copy_(output)
+            output = out
+        return output, final_state
     else:
-        return result.unsqueeze(0), None
+        output = result.unsqueeze(0)
+        if out is not None:
+            out.copy_(output)
+            output = out
+        return output, None
 
 
 @CustomOp.register("chunk_gated_delta_rule")
@@ -212,6 +221,7 @@ class ChunkGatedDeltaRule(CustomOp):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        out: torch.Tensor | None = None,
     ):
         return fi_chunk_gated_delta_rule(
             q=q,
@@ -223,6 +233,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            out=out,
         )
 
     def forward_native(
@@ -236,6 +247,7 @@ class ChunkGatedDeltaRule(CustomOp):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        out: torch.Tensor | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -247,6 +259,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            out=out,
         )
 
 
@@ -944,9 +957,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
+        direct_prefill_out = False
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
+            direct_prefill_out = spec_sequence_masks is None
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -960,6 +975,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 use_qk_l2norm_in_kernel=True,
+                out=(
+                    core_attn_out[:num_actual_tokens].unsqueeze(0)
+                    if direct_prefill_out
+                    else None
+                ),
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
@@ -999,7 +1019,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
+        elif not direct_prefill_out:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_non_spec(

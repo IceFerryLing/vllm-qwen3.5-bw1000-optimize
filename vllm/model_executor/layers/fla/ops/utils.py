@@ -145,6 +145,12 @@ device_platform = _check_platform()
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx936
+
+    is_amd_gfx936 = on_gfx936()
+else:
+    is_amd_gfx936 = False
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
@@ -156,6 +162,10 @@ is_tma_supported = (is_nvidia and torch.cuda.get_device_capability(0)[0] >= 9) a
     hasattr(triton.language, "_experimental_make_tensor_descriptor")
     or hasattr(triton.language, "make_tensor_descriptor")
 )
+
+
+def use_qwen35_gdn_prefill_tuning(H: int, K: int, V: int, BT: int) -> bool:
+    return is_amd_gfx936 and (H, K, V, BT) == (48, 128, 128, 64)
 
 
 def get_all_max_shared_mem():

@@ -16,30 +16,19 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
+from .utils import (
+    FLA_GDN_FIX_BT,
+    check_shared_mem,
+    is_nvidia_hopper,
+    use_qwen35_gdn_prefill_tuning,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT"],
-)
 @triton.jit(do_not_specialize=["T"])
-def chunk_fwd_kernel_o(
+def _chunk_fwd_kernel_o(
     q,
     k,
     v,
@@ -138,6 +127,29 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+chunk_fwd_kernel_o = triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)(
+    triton.autotune(
+        configs=[
+            triton.Config(
+                {"BK": BK, "BV": BV},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ],
+        key=["H", "K", "V", "BT"],
+    )(_chunk_fwd_kernel_o)
+)
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -147,6 +159,7 @@ def chunk_fwd_o(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -158,26 +171,47 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    if out is None:
+        o = torch.empty_like(v)
+    else:
+        if (
+            out.shape != v.shape
+            or out.dtype != v.dtype
+            or out.device != v.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("GDN output buffer must match the contiguous value tensor")
+        o = out
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+    args = (q, k, v, h, g, o, cu_seqlens, chunk_indices, scale)
+    if use_qwen35_gdn_prefill_tuning(H, K, V, BT):
+        _chunk_fwd_kernel_o[(1, NT, B * H)](
+            *args,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=32,
+            BV=128,
+            USE_G=g is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=2,
+            num_stages=1,
+        )
+    else:
 
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-    )
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), NT, B * H)
+
+        chunk_fwd_kernel_o[grid](
+            *args,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+        )
     return o
