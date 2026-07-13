@@ -4,53 +4,44 @@
 SourceFind/OpenDAS vLLM v0.18.1，目标环境是国产 DCU/BW1000（`gfx936`）上的
 Qwen3.5-27B BF16 单卡在线推理。
 
-本项目的演进分为两条相互关联、但不能混为一谈的线路：
+本项目的分支信息如下：
 
-- `develop` 是日常研究与 AI 辅助优化工作流的孵化线。它保存 profiling 探针、实验 patch、
-  失败回滚、比赛研究笔记、`AGENTS.md` 约束和项目专用 Codex skills。
-- `submit/vN` 是比赛提交线。从 baseline 重放已经筛选过的最小优化 patch；其中
-  `submit/v2.9` 是本文记录的当前优化版本。
+- `develop` 是日常研究分支。
+- `submit/vN` 是比赛提交线。
 
-因此，`develop` 上出现过的代码不一定进入 `submit/v2.9`，`submit/v2.9` 的后续优化也不一定
-回合并到 `develop`。下面的时间线同时展示“工作流如何形成”和“最终性能 patch 如何演进”，并
-明确标注回滚与旁支。
+因此，`develop` 上出现过的代码不一定进入 `submit/vx.x`，`submit/vx.x` 的后续优化也不一定
+回合并到 `develop`。
+在gitlab上，`develop`分支被更名为`workspace`。
 
-## 版本基准
-
-| 角色 | Git ref | Commit | 说明 |
-|---|---|---:|---|
-| 官方代码基线 | `target/submit/baseline` / `v0.18.1` | `01d6aad` | SourceFind/OpenDAS v0.18.1 比赛快照 |
-| AI 工作流孵化线 | `origin/develop` | `a9760fe` | 截至 2026-07-06 的工作流、研究材料和实验集成线 |
-| 当前提交优化线 | `target/submit/v2.9` / `submit/v2.9` | `97869b0` | 截至 2026-07-13，从 baseline 线性演进的比赛优化版本 |
-
-`submit/v2.9` 相对 baseline 有 23 个提交，净修改 20 个代码/测试/构建文件，约
-`+1629/-106`。`develop` 相对 baseline 的提交更多，但其中大量内容是文档、skills、研究记录、
-实验 kernel 和已回滚尝试，不能用提交数量衡量最终性能贡献。
-
-## 实际目标模型
-
-性能分析与 shape gate 必须以比赛 checkpoint 的 `config.json` 为准，不能用配置类的旧默认值
-代替实际模型。当前目标模型的文本侧关键配置是：
-
-- `hidden_size=5120`
-- `num_hidden_layers=64`
-- `num_attention_heads=24`
-- `num_key_value_heads=4`
-- `head_dim=256`
-- `intermediate_size=17408`
-- `full_attention_interval=4`
-
-Qwen3.5-27B 是 hybrid decoder：64 层中有 16 个 full-attention 层和 48 个
-linear-attention/Gated Delta Net（GDN）层。TP=1 时：
-
-- full attention 是 GQA，`num_queries_per_kv=6`；packed `qkv_proj` 输出宽度是
-  `q + gate + k + v = 14336`；
-- GDN `qkvz` 输出宽度是 `16384`，`out_proj` 是 `6144 -> 5120`；
-- dense MLP 是 `gate_up: 5120 -> 34816`、`down: 17408 -> 5120`；
-- LM head 是 `[248320, 5120]`；
-- 比赛 attention/KV page 形状可能使用 `BLOCK_SIZE=784`。
-
-这些事实决定了后文所有 attention、GEMV、GEMM 和 GDN 专用路径的触发条件。
+## 优化思路简述
+调研技术方案后，团队认为vllm 0.18.1 - 是一个非常关键的信息，这个版本号非常新，以至于团队相信，
+几乎所有通用性优化vllm社区都应该已经制作。
+早期调研发现，Qwen 3.5 的 hybrid KV cache 会对 attention page 与 GDN state page
+进行大小和 chunk 对齐，在目标配置下会将 attention 的 `BLOCK_SIZE` 计算为 784。另一方面，
+在未启用 AITER unified attention、AITER MHA 或 prefill/decode split backend 时，ROCm 平台级
+的 backend 优先级会默认回退到 Triton unified attention。这两个机制相互独立：前者产生
+非典型的大 page 形状，后者决定 full-attention 层的默认 backend。对初赛纯文本的
+full-attention prefill，实测发现在满足语义和 shape 约束时，将 K/V 转为连续布局后使用
+non-paged FlashAttention 比通用的 paged unified attention 更快。此外，线性注意力区有各种
+小 kernel，进一步拖累了整个模型的计算。
+最初团队认为，可能这个vllm在DCU上只是“能跑”的水准，但是团队拿到真实算力平台后，采样Triton JIT
+IR 发现，Triton编译器甚至能编译并使用builtin MMA能力，利用上DCU自身的matrix core，外加长期
+优化不顺，我们最终判定，哪怕是通用优化，triton编译器在这个平台上也已经做的足够好──以至于不能盲目
+手写custom kernel。事实上JIT技术也能拿到更多平台运行时信息，手写算子也更像黑盒，更不能搬迁NVIDIA
+经验。
+所以关键点是：1.怎么让Triton kernel跑的更快，在这个模型和平台上表现更好？2.能不能通过
+custom kernel实现自定义快速算子（后来证明难度很高且投入产出比低）；4.能不能想办法开启因为各种原因最
+终没有被选中的快速算子，从而绕开某些算子过于通用而不快的问题？
+对于1，我们通过利用AI工作流调整参数解决，比如调参BLOCK_M、TILE_SIZE，以及通过微调相关算子代码解决
+，比如线性注意力区投影的各种GEMV算子代码微调；对于4，我们先是通过将gfx936加入编译白名单，从而让其能
+够命中 LLGemm 算子，然后在 Triton backend 内为满足约束的 full-attention prefill 增加
+non-paged FlashAttention 快路径：当前 chunk 执行 causal FlashAttention，历史 K/V 从 paged
+cache gather 到连续 workspace 后执行 prefix attention，各段结果再通过 LSE merge 合并；
+decode 仍保持 Triton paged attention 路径。这减少了实际代码量，同时带来了巨大的吞吐提升，
+因为这个系统本来就拥有由于模型形状和平台检查而未被选中的快速路径。
+所有优化都和profile证据息息相关，尽管对hipprof工具的错误使用也产生了错误决策，但我们团队依然坚持
+以实际证据为主。事实上，我们团队最终能摸清到底哪些路径主导了整个流程，正是依靠AI profile工作流传回
+来的相关信息。
 
 ## AI 辅助优化工作流
 
@@ -82,7 +73,7 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
   收益不稳定或风险过高：回滚          收益稳定：合规审查和计分
                                              |
                                              v
-                                从 baseline 重放到 submit/vN
+                                  重放到 submit/vN 专门提交到测评机
 ```
 
 项目专用 skills 对应这个闭环的四个阶段：
@@ -97,6 +88,8 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
 全局边界由 [`AGENTS.md`](AGENTS.md) 约束，包括分支与 remote 语义、wheel 构建契约、远端
 工作区清洁检查、模型与 cache 位置、SCNet 容器操作、profile 有效性、官方 benchmark 边界、
 合规红线和提交前证据。
+
+代码通常也由AI生成后人工review，降低代码迭代成本。
 
 ## 统一演进时间线
 
@@ -122,9 +115,15 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
 ### 2026-06-23：从“猜热点”转向“先探针、后 patch”
 
 - **`develop` · `022c747`**：为 Triton unified attention 增加 block/probe controls，用于确认
-  实际执行路径、tile 和热点，而不是只凭源码静态判断。
+  实际执行路径、tile 和热点。
 - **`develop` · `34e5fd1`**：根据长 prefill 中的 fill 开销，实验性避免 GDN/linear-attention
   层对即将被完整覆写的 output buffer 预清零；保留 profile/padding 场景的条件性清零。
+  **说明**： fill相关开销后来被证明无效。核心原因是：一、在正确的profile指导下，FillFunctor不属于核心
+  热点，占比很小，哪怕真的有优化也会被热点淹没； 二、原本的设计经过通过查询vllm社区issues/PR，可以观察到
+  是有意为之──避免外部调用者默认导致错误调用。
+  但是在错误的profile请求（比如将vllm整个生命周期混入）中，FillFunctor<int>会被错误识别为全局热点，
+  因为vllm实现中，warmup阶段本身会创建一个64MiB buffer，用于warmup。
+  这浪费了团队的时间，但也提醒团队，到底应该关注什么，不应该关注什么。
 
 ### 2026-06-24：工作流开始围绕比赛得分闭环
 
@@ -134,6 +133,31 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
 - **`submit/v1` · `9097a14`**：把 unified attention 的 `BLOCK_M` 变成 wheel 构建期常量；
   `build_vllm.sh` 注入 `TRITON_UNIFIED_ATTN_BLOCK_M=64`。源码默认仍是 16，因此只有按提交
   构建脚本生成的 wheel 固化为 BM64。
+  **说明：`BLOCK_M` 是 Triton unified attention 的 query-row tile 参数。** kernel 会把同一
+  KV head 对应的“query token × GQA query head”展平成 M 维；一个 Triton program 一次处理
+  `BLOCK_M` 行，并通过 `BLOCK_Q = BLOCK_M // num_queries_per_kv` 换算出该 program 覆盖的
+  query token 数。它不是 KV cache 的物理 `BLOCK_SIZE`，也不是 K/V 序列方向每轮加载多少
+  token 的 `TILE_SIZE`。
+
+  对实际 Qwen3.5-27B，`num_queries_per_kv=24/4=6`：BM16 时 `BLOCK_Q=2`，每个 program
+  向前推进 2 个完整 query token，对应 12 个不重叠的 query-head rows；BM64 时 `BLOCK_Q=10`，
+  向前推进 10 个完整 query token，对应 60 个不重叠的 rows。当 `BLOCK_M` 不能被
+  `num_queries_per_kv` 整除时，当前 Triton kernel 没有额外的 active-row mask；因此在非末尾
+  q-block 中，多出的 4 行会与下一个 q-block 的前 4 个 query-head rows 重叠计算，而不是被
+  mask 屏蔽。长 prefill 下，BM64 能减少 query-block/program 数量，将这部分重叠计算的
+  行占比从 `4/16` 降到 `4/64`，并让更多 query rows 复用同一轮 K/V tile、block-table
+  寻址和 softmax 循环开销。自定义 HIP UA2D kernel 另外实现了 active-row mask，才会屏蔽
+  这 4 个尾行。
+
+  更大的 `BLOCK_M` 也会增加 Q、softmax 状态和 output accumulator 的寄存器压力，可能降低
+  occupancy、引发 spill，或者在短 query/decode 中产生更多无效行。因此 BM64 不是通用常数，
+  必须针对 `head_dim=256`、Q/KV head 比、prefill/decode 路由和 gfx936 实测。该参数作为 Triton
+  `constexpr` 参与 kernel specialization；比赛平台又不能依赖启动时注入自定义环境变量，所以
+  v1 通过 `build_vllm.sh` 在 wheel 构建阶段把默认值固化为 64。它只改变并行分块与资源使用，
+  不改变 attention 的因果 mask、KV 内容或模型数学语义。
+
+  在吞吐测试中，AI工作流将过长的E2E等待时间错误判定为熔断证据，但是在实际算力平台上，几十秒的E2E、
+  几十分钟的编译时间是家常便饭。应该避免AI工作流靠猜来认为服务异常。
 
 ### 2026-06-25：访存实验与首次“保留有效部分、回滚噪声部分”
 
@@ -141,6 +165,7 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
   当 32-token KV tile 完全位于 `BLOCK_SIZE=784` 的同一 page 时，只读一次 block table 并使用
   标量 page offset；跨 page 继续走原向量寻址。提交明确标注仍需 DCU JIT、吞吐、accuracy、
   cache、寄存器和 kernel time 证据。
+  这个提交最终被证实无用。因为attention kernel真正的瓶颈是stall时间。
 - **`develop` · `9ee3296`**：保存 BM64 和 metadata fill/copy 收窄实验。4-8K 10 请求记录为
   output throughput `13.23 tok/s`、TTFT P99 `2248.73 ms`、TPOT P99 `68.89 ms`，快速
   accuracy 通过。
@@ -164,6 +189,14 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
   extension。该提交属于后续自定义 ROCm kernel 能随 wheel 交付的构建前提。
 - **`submit/v1.2` · `f7a8de6`**：尝试改写 LLMM1，让 Qwen MLP `down_proj` 也走该路径。
   这项尝试后来在 07-06 被完整回滚。
+  **说明**：这项工作主要和decode阶段有关。Qwen的线性注意力投影阶段会命中大量的小GEMV，这些GEMV是
+  通用算子，性能受限，在I/O上频繁等待。通过切换到LLGemm1，这是skinny GEMM的一部分，它在N=1上有特
+  化的效果，最终通过吞吐数据证明它能比通用GEMM本身有更好的效果。
+  尝试过在调用层融合in_proj_qkvz和in_proj_ba两个算子，失败（性能倒退）。可能是因为这种融合破坏了
+  `16384`这种规整的矩阵宽，导致尾部开销>融合收益。
+  当然，这些算子本身。事实上后面也试过将n=1的tensor给padding到n=16，空算十五倍看看能不能缓解I/O难题；
+  也试过padding 其他n看看能不能选到更好的kernel，microbench阶段确实有成绩，但是实际vllm未命中（矩
+  阵形状错配，后来因为时间不充裕也没有继续尝试）
 
 ### 2026-07-04～05：develop 上完成一次自定义 UA2D 的完整实验链
 
@@ -184,7 +217,15 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
 - **`develop` · `60105f1`**：按 Qwen decode projection shape 微调 LLMM1
   `rows_per_block`。这是 develop HEAD 上最后一个性能提交。
 
-### 2026-07-06：develop 阶段收束，submit 线转向 Strided-K
+  **说明**：自定义UA2D的尝试无疑是失败的。首先是试图仿照triton unified attention来写，但是triton
+  本身就已经能编译到相对底层，而且后者真正卡住的地方是频繁的stall时间。通过切换到Flash Attention，
+  在定向的纯文本请求下去使用计算开销更小、数据等待时间更短从而更快的算子，带来的收益要远大于盲目custom
+  kernel。
+
+### 2026-07-06：submit 线转向 Strided-K
+
+  **说明**：由于期末考试压力巨大且时间紧张，这一阶段几乎不再使用develop和submit双轨，有优化点会
+  制作成一版submit并直接提交到评测机尝试。
 
 - **`develop` · `74c992a`、`a9760fe`**：补齐官方 `run_throughput.sh` 边界、run 目录提前
   告知、wheel 路径记录和远端操作约束。`a9760fe` 是本文采用的 develop 工作流快照。
@@ -223,6 +264,11 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
   BF16 pair 转 FP32，使用 FP32 `fmaf` 累加，最终再转 BF16；同时增加 Qwen projection 和
   `down_proj` accuracy 测试。该改动既减少 BF16 模拟开销，也让结果更接近 rocBLAS。
 
+  **说明**：这一阶段的优化围绕继续优化decode展开。profile证据显示prefill本身（TTFT指标）随着上下
+  文数量呈现线性变化，而最后吞吐依旧由decode去主导。decode还是卡在线性注意力各种投影调用产生的小GEMM
+  而不是triton unified attention 3d。所以我们利用AI工作流，在期末复习的闲暇，继续深入研究这些小
+  GEMM到底应该怎么调整，才能充分利用带宽。
+
 ### 2026-07-11：decode MLP 融合与 4096-token prefill 专用解
 
 - **`submit` · `d0b1ce1`**：将 3D decode softmax segments 改成环境变量
@@ -260,93 +306,43 @@ linear-attention/Gated Delta Net（GDN）层。TP=1 时：
   预分配 `core_attn_out`，消除一次临时 output 与 copy；其他 shape/平台继续走原 autotune，
   避免短序列 warmup 污染长上下文配置。
 
-## submit/v2.9 最终生效的优化
+  **说明：这项优化针对 Qwen3.5-27B 占比最高的 GDN prefill 主路径。** 模型共有 64 个
+  decoder layer，其中 48 层是 linear-attention/GDN，只有 16 层是 full attention。因此，
+  即使单次 GDN kernel 的收益不如大 GEMM 显眼，相关开销也会在一次 forward 中重复 48 次。
+  需要区分两个容易混淆的“48”：模型有 48 个 GDN layer；调优条件中的 `H=48` 则表示每一层
+  GDN kernel 的 48 个 value heads，并不是层数。`K=128`、`V=128` 分别是 key/value head
+  dimension，`BT=64` 是 GDN chunk 的 token tile 大小。
 
-| 路径 | 最终优化 | 主要触发条件/回退 |
-|---|---|---|
-| Wheel 构建 | unified attention `BLOCK_M=64` 构建期注入 | 必须使用 `build_vllm.sh` 或显式设置构建变量；普通源码默认是 16 |
-| Full-attention prefill | 非 paged FlashAttention、历史分段 LSE merge | ROCm、BF16/FP16 KV、支持的 head_dim 和普通 causal decoder 语义；否则回退 Triton |
-| 单请求 full-attention prefill | 每层连续 KV 镜像；30K 内 full-KV FA | Qwen 24Q/4KV/head_dim256，默认镜像容量 32K；失配、多请求或超容量回退 gather |
-| Triton prefill fallback | `TILE_SIZE=16` | 可用 `VLLM_PREFILL_ATTN_TILE_SIZE` 恢复/调节 |
-| Full-attention decode | 3D softmax 默认 256 segments | 可用环境变量调整；不改变 2D/3D 原路由语义 |
-| 通用单 token projection | Strided-K GEMV + shape 化 rows/thread | ROCm gfx9、FP16/BF16、N=1、无 bias、K 对齐；否则回退 LLMM1/rocBLAS/linear |
-| Dense MLP decode gate_up | GEMV + SwiGLU 融合 | Qwen3.5-27B、TP=1、BF16、无量化、无 LoRA、单 token；否则走原 MLP |
-| Dense MLP decode down | `[5120,17408]` rows=1/1024-thread GEMV | gfx936 BF16 精确 shape；否则通用 Strided-K 或原 linear |
-| Decode LM head | `[248320,5120]` Strided-K rows=2 | gfx936 BF16 精确 shape；其他大词表保持原路由 |
-| 4096-token MLP prefill | rocBLAS solution 20981 gate_up、20980 down | gfx936 BF16、二维连续 tensor、无 bias、精确 4096-token shape；否则原 GEMM |
-| 48 层 GDN prefill | 固定真实 shape 的 Triton 参数，output 直写 | gfx936 `(48,128,128,64)`；其他平台/shape 保留 autotune |
+  一次 native Triton/FLA GDN prefill 并不是单个 attention kernel，而是依次执行
+  `chunk_local_cumsum -> chunk_scaled_dot_kkt_fwd -> solve_tril -> recompute_w_u_fwd ->`
+  `chunk_gated_delta_rule_fwd_h -> chunk_fwd_o`。其中 `recompute_w_u_fwd` 生成 WY 表示所需的
+  `w/u`，`chunk_fwd_h` 按 chunk 推进 recurrent state 并产生 `v_new`，最后 `chunk_fwd_o`
+  将 query、chunk 内 attention 和历史 state 合成为本层输出。v2.9 主要优化后三个在 profile
+  中反复出现、且能够保持算法不变的 Triton kernel。
 
-## 未进入 v2.9 的尝试
+  原实现对这些 kernel 使用 autotune，但 autotune key 主要包含 `H/K/V/BT`，没有把完整序列
+  长度 `T` 作为调参维度。短序列 warmup 和正式 16K～32K prefill 的 `H/K/V/BT` 完全相同，
+  因而短序列选出的配置可能被缓存并复用于长上下文；同时每个 fresh cache 都需要承担候选配置
+  试跑成本。v2.9 在且仅在 `gfx936 + (H,K,V,BT)=(48,128,128,64)` 时绕过 autotune wrapper，
+  直接调用底层 Triton kernel，并固定为针对目标 shape 选出的配置：
 
-以下提交存在于历史，但不属于 v2.9 最终净优化：
+    - `chunk_fwd_h`：`BV=32`、`num_warps=8`、`num_stages=1`；把 128-wide value dimension
+      分成 4 个 value tiles，以更多 program/warps 展开 state 更新，同时避免过深 pipeline
+      增加寄存器和 shared-memory 压力。
+    - `chunk_fwd_o`：`BK=32`、`BV=128`、`num_warps=2`、`num_stages=1`；`BV=128` 一次覆盖
+      完整 value dimension，使 grid 的 value 方向只有一个 program，减少重复的 query/state
+      读取和边界处理。
+    - `recompute_w_u_fwd`：`BK=64`、`BV=128`、`num_warps=2`、`num_stages=2`；一次覆盖完整
+      value dimension，避免原 `BV=64` 下同一 chunk/value 工作被拆成两份。
 
-- v1.2 强制 `down_proj` 走 LLMM1：已由 `61ab7c8` 回滚；最终改用 Strided-K 专用 kernel。
-- GDN/linear-attention output 清零收窄：只在 develop 实验，已由 `bbfc3c4` 回滚。
-- metadata fill/copy staging：只在 develop 实验，收益未超过噪声，已由 `7116743` 回滚。
-- 首版 fused K/V gather：已由 `4490eaf` 回滚；最终用连续 KV 镜像降低重复 gather。
-- `submit/v2.2` 小 N MLP padding：独立旁支，不是 v2.9 祖先，且使用旧模型 shape。
-- develop 自定义 UA2D：保留为显式开关的实验 kernel，没有进入 `submit/v2.9`。
+  另一项收益来自 output 直写。原路径先在 `chunk_fwd_o` 中执行 `torch.empty_like(v)` 创建临时
+  `o`，48 个 GDN 层各自产生一个中间 tensor，随后再执行
+  `core_attn_out[:num_actual_tokens] = o.squeeze(0)`。v2.9 将已经由 model runner 预分配的
+  `core_attn_out` 以可选 `out` 参数一路传入 GDN custom op 和 `chunk_fwd_o`，让 Triton kernel
+  直接写最终地址，从而消除临时 output 的分配和一次 device-to-device copy。该直写只在普通
+  non-spec prefill、无需按 speculative mask 合并输出时启用；存在 spec/mixed sequence 时仍走
+  原来的临时 tensor 和 merge 路径。
 
-## 性能证据的解释边界
-
-历史提交和研究记录中包含若干 kernel/microbench 数据，例如：
-
-- Strided-K 对部分 decode projection 的带宽提升记录约为 7%～20%；
-- `K=5120` 的 640-thread 调参对部分大 projection 的记录约为 9%～10%；
-- Triton prefill TILE 32 -> 16 的 kernel 级记录约为 2.6～2.8 倍；
-- develop UA2D 的 Q@K microbench 记录为 `97.6 -> 59.1 us`；
-- 3D decode softmax 16 -> 32 的历史 kernel 记录在 24K～32K 约快 26%～30%。
-
-这些数字来自不同阶段、不同 kernel 或短样本，不能相加，也不能直接等同于 v2.9 的官方端到端
-吞吐提升。尤其最终 v2.9 使用 256 个 decode softmax segments，而不是中间实验的 32。
-
-正式结论必须来自同一官方 workload 下的：
-
-1. 干净 baseline 与候选 wheel；
-2. `run_throughput.sh` 的 4-8K、8-16K、16-32K 三档原始 `result.json`；
-3. TTFT P99、全局 TPOT P99 和完成率 SLA；
-4. QA、摘要、检索和聚合四类 accuracy；
-5. 明确的源码 commit、构建命令、wheel 路径、服务参数和环境记录。
-
-另外，2.9 的连续 KV 镜像和 256-segment decode workspace 会使用额外显存。它们可能降低 paged
-KV cache 容量或最大并发，必须结合服务启动日志中的 KV cache token 数和三档吞吐结果评估，
-不能只看 attention kernel 时间。
-
-## 构建与验证契约
-
-提交版本必须在比赛容器中通过 wheel 路径交付，不依赖 `PYTHONPATH`、editable install 或手工
-修改 `site-packages`：
-
-```bash
-set +u
-source /opt/dtk/env.sh
-set -u
-export LD_LIBRARY_PATH=/opt/dtk/lib:/opt/dtk/hip/lib:/opt/dtk/dcc/lib:${LD_LIBRARY_PATH:-}
-
-./build_vllm.sh
-pip install --force-reinstall dist/vllm-*.whl --no-deps
-```
-
-随后至少完成：
-
-1. import smoke 和目标 Triton/HIP JIT probe；
-2. 新增 kernel 的 correctness/accuracy 测试；
-3. 官方 `run_throughput.sh` 三档 A/B；
-4. 官方 accuracy；
-5. 对最终 diff 做比赛合规审查。
-
-性能、构建和兼容性结论只来自官方 DCU 容器/算力节点。登录节点、本地开发机和公共 GitHub
-Actions 只能做源码、Git、文档和语法层面的检查。
-
-## 分支与提交边界
-
-- `v0.18.1`：只跟踪 baseline，不直接开发。
-- `develop`：接收实验 patch、诊断、研究材料和工作流改进；不等同于评测提交。
-- `exp/*`：实验线，默认不作为正式提交代码。
-- `main`：稳定集成线，只接受通过基本构建、正确性和合规检查的改动。
-- `submit/vN`：从 baseline 重放最小提交 patch；除非任务明确要求，不直接修改。
-- `target`：官方目标 GitLab remote，只接受 `submit/*`；Agent 不向该 remote push，由队员手动
-  完成最终推送。
-
-所有 AI 辅助生成或修改的代码都必须由提交者逐行 review，并能够解释命中路径、模型 shape、
-数学语义、回退条件、构建方式、性能证据和合规风险。
+- **`submit/v3.0` · `8bf1196`、`f916d70`、`442994b`**：按 NT、head 数和 K/V 维度泛化 gfx936
+  长上下文 GDN prefill 配置选择，复用 chunk indices，并预热长上下文 specialization，
+  避免首个长请求触发 Triton JIT 而导致 SLA 熔断。
