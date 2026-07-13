@@ -19,7 +19,7 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
-TRITON_UNIFIED_ATTN_BLOCK_M = 16
+TRITON_UNIFIED_ATTN_BLOCK_M = int(os.environ.get("TRITON_UNIFIED_ATTN_BLOCK_M", "64"))
 
 # Prefill full-attention tile size. On gfx936 with HEAD_SIZE=256 the default 32
 # crushes occupancy via LDS pressure (1 wave/SIMD); 16 unlocks 2 waves/SIMD and
