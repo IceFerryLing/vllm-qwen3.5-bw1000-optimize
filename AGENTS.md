@@ -77,29 +77,33 @@ patch的意思是，对远程工作区恢复到正确状态后，做小的优化
 
 ## Qwen3.5 模型结构速查
 
-分析 Qwen3.5-27B 性能、attention、Triton tile、KV cache 或 int8 路径前，必须先按本节模型
-结构判断，不要套用普通 dense Qwen/Llama 的 Q/K/V 形状经验。
+分析 Qwen3.5-27B 性能、attention、Triton tile、KV cache 或投影 GEMM 前，**先读取实际目标
+模型目录的 `config.json`**，并把所用关键字段写入 run 记录。不要用
+`vllm/transformers_utils/configs/qwen3_5.py` 的 schema/default 覆盖目标 checkpoint 的配置；
+它曾导致把实际 64 层模型误按 32 层、把真实 decode 投影 shape 误判为 4096 宽度。
 
-- 文本侧默认配置见 `vllm/transformers_utils/configs/qwen3_5.py`：`hidden_size=4096`、
-  `num_hidden_layers=32`、`num_attention_heads=16`、`num_key_value_heads=4`、
-  `head_dim=256`、`intermediate_size=12288`。
-- Qwen3.5 是 hybrid decoder。默认 `full_attention_interval=4`，因此 0-based 层号
-  `3,7,11,15,19,23,27,31` 是 `full_attention`，其余 24 层是 `linear_attention`
-  / Gated Delta Net，不是每层都跑 full self-attention。
-- full attention 复用 `Qwen3NextAttention`。它是 GQA：全局 `16` 个 query heads、`4` 个
-  KV heads、`head_dim=256`，所以 TP=1 时 `q_size=4096`、`kv_size=1024`、
-  `num_queries_per_kv=4`。进入 Triton unified attention 时应按
-  `num_query_heads=16/tp`、`num_kv_heads=max(1, 4/tp)`、`HEAD_SIZE=256` 理解。
-- full attention 的 `qkv_proj` 默认还带 `attn_output_gate=True`。TP=1 时 packed 输出不是
-  简单 `Q+K+V`，而是 `q + gate + k + v = 4096 + 4096 + 1024 + 1024`。代码里对应
-  `q_gate, k, v = qkv.split([q_size * 2, kv_size, kv_size], dim=-1)`，随后
-  `q_gate` 再拆成 `q` 和 `gate`。
-- linear attention / GDN 路径也不是普通 Q/K/V：默认 `linear_num_key_heads=16`、
-  `linear_num_value_heads=32`、`linear_key_head_dim=128`、`linear_value_head_dim=128`，
-  因此 TP=1 时 `key_dim=2048`、`value_dim=4096`。Qwen3.5 覆写的
-  `create_qkvz_proj` 输出 `[key_dim, key_dim, value_dim, value_dim]`，即
-  `q=2048, k=2048, v=4096, z=4096`；`in_proj_ba` 输出 `[num_v_heads, num_v_heads]`。
-  这条路径进入 `gdn_attention_core`，不要和 Triton unified full attention 混为一谈。
+当前比赛模型 `<TEAM_HOME> 的文本侧事实为：
+
+- `hidden_size=5120`、`num_hidden_layers=64`、`num_attention_heads=24`、
+  `num_key_value_heads=4`、`head_dim=256`、`intermediate_size=17408`。
+- Qwen3.5 是 hybrid decoder，`full_attention_interval=4`；0-based 层号
+  `3,7,...,63` 共 16 层是 `full_attention`，其余 48 层是 `linear_attention` /
+  Gated Delta Net。任何 per-token kernel 或 projection call 数估算必须以 `48 + 16` 为准。
+- full attention 复用 `Qwen3NextAttention`。它是 GQA：TP=1 时
+  `q_size=24*256=6144`、`kv_size=4*256=1024`、`num_queries_per_kv=6`。进入 Triton
+  unified attention 时按 `num_query_heads=24/tp`、
+  `num_kv_heads=max(1, 4/tp)`、`HEAD_SIZE=256` 理解。
+- full attention 的 `qkv_proj` 带 `attn_output_gate=True`。TP=1 的 packed 输出为
+  `q + gate + k + v = 6144 + 6144 + 1024 + 1024 = 14336`，不是简单 `Q+K+V`。
+- GDN 路径的实际配置是 `linear_num_key_heads=16`、`linear_num_value_heads=48`、
+  `linear_key_head_dim=128`、`linear_value_head_dim=128`，因此 TP=1 时
+  `key_dim=2048`、`value_dim=6144`。Qwen3.5 的 `create_qkvz_proj` 输出
+  `[2048, 2048, 6144, 6144]`（总宽 `16384`），`in_proj_ba` 输出 `[48, 48]`
+  （总宽 `96`），`out_proj` 是 `6144 -> 5120`。这条路径进入
+  `gdn_attention_core`，不要和 Triton unified full attention 混为一谈。
+- dense MLP 的投影为 `gate_up: 5120 -> 2*17408=34816` 和
+  `down: 17408 -> 5120`。任何为旧 `(4096, 12288)` / `(4096, 24576)` 形状写的 gate，
+  在当前模型上都不命中，必须在实验前明确排除或重做 shape gate。
 - 本模型 full attention 的 `head_dim=256`，且比赛路径里 attention/KV page/block 形状可能
   出现 `BLOCK_SIZE=784`。讨论 `triton_unified_attention.py` 的 `TILE_SIZE`、`BLOCK_M`、
   int8 K cache、LDS/stall 或 backend fallback 时，默认先按 `HEAD_SIZE=256` 和实际
@@ -117,8 +121,52 @@ patch的意思是，对远程工作区恢复到正确状态后，做小的优化
 
 登录节点的端口为`<COMPETITION_LOGIN_PORT>`，用户名`c118-team`，ssh密钥为 `~/.ssh/<TEMPORARY_CREDENTIAL>`
 
-ssh 连接计算节点后，可以通过 `docker ps` 查看容器列表，`c118` 创建的容器为我们的容器，
-可以通过 `docker exec 容器id ...` 来访问。
+**禁止使用原生 `docker ps` 或 `docker exec`**。比赛平台的 Docker socket 对普通用户通常不可见，
+而且原生 Docker 操作不应写入工作流。应先通过实例目录中的容器映射定位容器，并优先从
+计算节点内 SSH 到容器 IP：
+
+1. 在登录节点用 `squeue` 找到运行中的 job 和 `NODELIST`；若状态为 `PD`，先按本文件的
+   120 秒轮询规则询问用户。
+2. 读取
+   `<TEAM_HOME>
+   该文件的 `NODE=` 是计算节点，`NAME=`（例如 `<jobid>_<node>`）是平台 wrapper 的容器名，
+   `IPADDR=` 是容器 IP。
+3. `ssh <NODE>` 到计算节点后，从**计算节点内部**进入容器：
+
+   ```bash
+   ssh -tt -o BatchMode=yes -o StrictHostKeyChecking=no \
+     -o UserKnownHostsFile=/dev/null root@<IPADDR>
+   ```
+
+   容器 `IPADDR` 通常只在计算节点网络中可达；不要从登录节点或本地机器直接 SSH 该 IP。
+   已验证的链路是“本地/登录节点 -> `ssh <NODE>` -> `ssh root@<IPADDR>`”。
+4. 对复杂容器操作，先新建 `temp_shell/<年-月-日>/<new-script>.sh`，再在容器中执行：
+
+   ```bash
+   bash <TEAM_HOME>
+   ```
+
+   若计算节点内的容器 SSH 不可用，才使用平台备用入口：
+
+   ```bash
+   ai_docker exec <NAME> bash <TEAM_HOME>
+   ```
+
+   `ai_docker` 只能在计算节点使用，不在登录节点直接执行；它可能要求平台授予的节点权限，
+   不得退回原生 Docker。
+
+`ai_docker exec` 会拆坏复杂引号、管道、正则、JSON 和内联 Python。除非常简单的单命令外，
+必须为本次任务新建一个脚本；脚本放在 `temp_shell/<年-月-日>/`，再仅把 `bash <script>`
+作为 wrapper 参数传入。禁止复用旧脚本；若用户明确要求复用，先 Read 确认其内容。写完脚本后，
+必须向用户说明脚本路径、做什么，以及它是否会杀 vLLM（默认不得杀）。每个 fresh 容器进入后，
+先加载 DTK 环境，再执行任何 build、import、JIT、service、benchmark 或 profiler：
+
+```bash
+set +u
+source /opt/dtk/env.sh
+set -u
+export LD_LIBRARY_PATH=/opt/dtk/lib:/opt/dtk/hip/lib:/opt/dtk/dcc/lib:${LD_LIBRARY_PATH:-}
+```
 
 如果命令过长，必要时编辑 shell 脚本，所有临时的 shell 脚本放置在
 `<TEAM_HOME> 下。对于吞吐测试的相关工作文件，放置在
