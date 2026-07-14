@@ -21,6 +21,23 @@ is_batch_invariant = vllm_is_batch_invariant()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 TRITON_UNIFIED_ATTN_BLOCK_M = int(os.environ.get("TRITON_UNIFIED_ATTN_BLOCK_M", "64"))
 
+# The 3D kernel is only used for decode. Qwen3.5-27B has six query heads per
+# KV head, so BLOCK_M=64 allocates a [64, 256] FP32 accumulator while only six
+# rows are useful. The smaller decode-specific tile substantially reduces
+# register pressure without changing the BLOCK_M=64 prefill/2D specialization.
+TRITON_UNIFIED_ATTN_3D_BLOCK_M = int(
+    os.environ.get("TRITON_UNIFIED_ATTN_3D_BLOCK_M", "16")
+)
+TRITON_UNIFIED_ATTN_3D_TILE_SIZE = int(
+    os.environ.get("TRITON_UNIFIED_ATTN_3D_TILE_SIZE", "16")
+)
+for name, value in (
+    ("TRITON_UNIFIED_ATTN_3D_BLOCK_M", TRITON_UNIFIED_ATTN_3D_BLOCK_M),
+    ("TRITON_UNIFIED_ATTN_3D_TILE_SIZE", TRITON_UNIFIED_ATTN_3D_TILE_SIZE),
+):
+    if value <= 0 or value & (value - 1):
+        raise ValueError(f"{name} must be a positive power of two, got {value}")
+
 # Prefill full-attention tile size. On gfx936 with HEAD_SIZE=256 the default 32
 # crushes occupancy via LDS pressure (1 wave/SIMD); 16 unlocks 2 waves/SIMD and
 # is 2.6-2.8x faster on-card, numerically equivalent (bf16 accumulation-order
@@ -39,6 +56,19 @@ def _get_block_m(num_queries_per_kv: int) -> int:
                 f"num_queries_per_kv={num_queries_per_kv}, got {block_m}"
             )
         return block_m
+
+    return triton.next_power_of_2(num_queries_per_kv)
+
+
+def _get_3d_block_m(num_queries_per_kv: int) -> int:
+    if num_queries_per_kv <= 16:
+        if num_queries_per_kv > TRITON_UNIFIED_ATTN_3D_BLOCK_M:
+            raise ValueError(
+                "TRITON_UNIFIED_ATTN_3D_BLOCK_M must be >= "
+                f"num_queries_per_kv={num_queries_per_kv}, got "
+                f"{TRITON_UNIFIED_ATTN_3D_BLOCK_M}"
+            )
+        return TRITON_UNIFIED_ATTN_3D_BLOCK_M
 
     return triton.next_power_of_2(num_queries_per_kv)
 
@@ -902,7 +932,7 @@ def _get_tile_size(
     # Default behavior
     if is_prefill:
         return TRITON_UNIFIED_ATTN_PREFILL_TILE_SIZE
-    return 16 if element_size >= 2 else 32
+    return TRITON_UNIFIED_ATTN_3D_TILE_SIZE if element_size >= 2 else 32
 
 
 def unified_attention(
@@ -963,8 +993,8 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = _get_block_m(num_queries_per_kv)
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    BLOCK_M_2D = _get_block_m(num_queries_per_kv)
+    BLOCK_Q_2D = BLOCK_M_2D // num_queries_per_kv
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -975,7 +1005,7 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks_2d = q.shape[0] // BLOCK_Q_2D + num_seqs
 
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
@@ -986,7 +1016,7 @@ def unified_attention(
         q.element_size(),
         is_prefill=True,
     )
-    TILE_SIZE_DECODE = _get_tile_size(
+    TILE_SIZE_3D = _get_tile_size(
         head_size,
         sliding_window_val,
         q.element_size(),
@@ -1010,7 +1040,7 @@ def unified_attention(
     ):
         kernel_unified_attention_2d[
             (
-                total_num_q_blocks,
+                total_num_q_blocks_2d,
                 num_kv_heads,
             )
         ](
@@ -1058,14 +1088,18 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_2D,
             num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=BLOCK_M_2D,
             USE_FP8=output_scale is not None,
         )
     else:
+        BLOCK_M_3D = _get_3d_block_m(num_queries_per_kv)
+        BLOCK_Q_3D = BLOCK_M_3D // num_queries_per_kv
+        total_num_q_blocks_3d = q.shape[0] // BLOCK_Q_3D + num_seqs
+
         kernel_unified_attention_3d[
-            (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+            (total_num_q_blocks_3d, num_kv_heads, num_par_softmax_segments)
         ](
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,
@@ -1089,7 +1123,7 @@ def unified_attention(
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=TILE_SIZE_3D,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
@@ -1110,9 +1144,9 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_3D,
             num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=BLOCK_M_3D,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
@@ -1127,11 +1161,11 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=TILE_SIZE_3D,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_3D,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
         )

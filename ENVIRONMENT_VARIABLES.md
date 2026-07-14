@@ -4,6 +4,8 @@
 
 ```bash
 export TRITON_UNIFIED_ATTN_BLOCK_M=64
+export TRITON_UNIFIED_ATTN_3D_BLOCK_M=16
+export TRITON_UNIFIED_ATTN_3D_TILE_SIZE=16
 export VLLM_PREFILL_ATTN_TILE_SIZE=16
 export VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS=256
 export VLLM_TRITON_FA_PREFILL=1
@@ -18,8 +20,18 @@ export VLLM_ROCM_STRIDED_GEMV=True
 
 ### `TRITON_UNIFIED_ATTN_BLOCK_M=64`
 
-- **作用：** 设置 Triton Unified Attention kernel 在 query/head 维度上的 `BLOCK_M`。
-- **配置原因：** 在 Unified Attention 路径中，GQA 的 query heads 会按 KV head 分组映射到 `BLOCK_M`，该参数决定一个 Triton program 同时展开的 query/head 行数。调高 BLOCK_M 能在 query 较长时让一个 program 覆盖更多 query 行，减少 q-block program 数，并在更多行之间摊薄 paged-KV 地址计算和 block-table 查询等逐开销，而代价是更大的 query/FP32 accumulator、较高的寄存器压力以及序列尾部更多的掩码计算。经测试，将 `64` 作为 BW1000/gfx936 上纯 Triton Unified Attention 路径的默认值。
+- **作用：** 设置 Triton Unified Attention 2D kernel 在 query/head 维度上的 `BLOCK_M`；3D decode kernel 使用独立变量，不读取该变量。
+- **配置原因：** 在 Unified Attention 2D 路径中，GQA 的 query heads 会按 KV head 分组映射到 `BLOCK_M`，该参数决定一个 Triton program 同时展开的 query/head 行数。调高 BLOCK_M 能在 query 较长时让一个 program 覆盖更多 query 行，减少 q-block program 数，并在更多行之间摊薄 paged-KV 地址计算和 block-table 查询等逐开销，而代价是更大的 query/FP32 accumulator、较高的寄存器压力以及序列尾部更多的掩码计算。经测试，将 `64` 作为 BW1000/gfx936 上纯 Triton Unified Attention 2D 长 query 路径的默认值。
+
+### `TRITON_UNIFIED_ATTN_3D_BLOCK_M=16`
+
+- **作用：** 设置3D decode Unified Attention kernel 在 query/head 维度上的 `BLOCK_M`，并据此独立计算 `BLOCK_Q` 和 launch grid。
+- **配置原因：** Qwen3.5-27B 每个 KV head 对应6个 query heads，decode 时只有一个 query token。`BLOCK_M=64` 会为大量无效行保留 `[64,256]` FP32 accumulator，增加寄存器压力；联合扫描表明 `16` 在4K～32K均明显快于64，同时避免 `BLOCK_M=8` 导致 `BLOCK_Q=1` 和额外无效 q-block。
+
+### `TRITON_UNIFIED_ATTN_3D_TILE_SIZE=16`
+
+- **作用：** 设置非 Gemma、BF16/FP16 3D decode Unified Attention kernel 沿 KV 序列处理的 `TILE_SIZE`。Gemma3和FP8路径继续使用32。
+- **配置原因：** 在目标 `24Q/4KV/head_dim=256` shape 的 `BLOCK_M/TILE_SIZE/segments` 联合扫描中，`TILE_SIZE=16` 是固定配置的最优选择；TILE32增加片上资源压力，没有取得收益。
 
 ### `VLLM_PREFILL_ATTN_TILE_SIZE=16`
 

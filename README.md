@@ -122,18 +122,19 @@ LM head 中的 GEMM/GEMV。Prefill 主要处理大矩阵和长序列 attention�
 
 ### Full-attention prefill
 
-1. **Unified Attention `BLOCK_M=64`。**
+1. **Unified Attention 2D `BLOCK_M=64`。**
    [`unified_attention`](vllm/v1/attention/ops/triton_unified_attention.py) 将同一 KV head 下的
    “query token × GQA query head”展平到 M 维，再通过
    `BLOCK_Q = BLOCK_M // num_queries_per_kv` 决定一个 program 覆盖的 query token 数。
    对目标 `24Q/4KV`，提高 `BLOCK_M` 能在长 query 下减少 q-block program 数，让更多 query
    rows 复用 block-table 寻址和 K/V tile 循环；代价是更大的 Q/softmax/accumulator 状态及
-   更高寄存器压力。`d56a55b` 后该值在运行时读取，默认 64。gfx936 单卡微基准表明，这一选择
+   更高寄存器压力。`d56a55b` 后该值在运行时读取，默认 64，且当前只作用于2D kernel。gfx936 单卡微基准表明，这一选择
    明确面向长 query：q_len=4096 时，BM32→BM64 在 4K/16K/32K context 分别由
    **7.462→4.734 ms、48.890→30.440 ms、103.748→64.627 ms**，用时降低
    **36.6%～37.7%**；q_len=1 的纯 2D UA 中则是 BM32 最快，4K/16K/32K 分别为
    **0.514/2.021/4.031 ms**，BM64 为 **0.573/2.251/4.485 ms**。因此 BM64 是纯
-   Triton 长 prefill 的 shape specialization，不是 decode 的通用最优值。满足条件的 Qwen3.5
+   Triton 长 prefill 的 shape specialization，不是 decode 的通用最优值。3D decode 已拆出默认
+   `BLOCK_M=16` 的独立环境变量，不会再继承2D配置。满足条件的 Qwen3.5
    prefill 默认走后述 FlashAttention 路径，BM64 主要覆盖 Triton 回退和其他 UA prefill 场景。
 
 2. **Prefill `TILE_SIZE=16`。**
@@ -168,13 +169,17 @@ LM head 中的 GEMM/GEMV。Prefill 主要处理大矩阵和长序列 attention�
 长上下文时无法充分利用。3D kernel 将 KV 序列切成多个 segment，分别写出局部
 output/max/expsum，再由 `reduce_segments` 合并。
 
-实机 sweep 覆盖 segments=16/32/64/128/256。4K～16K 的 3D+reduce 总延迟都在
-**259～264 µs** 左右；24K 时 16→256 由 **362.512→263.326 µs**，用时降低 **27.36%**；
-32K 时由 **469.470→263.688 µs**，用时降低 **43.83%**。256 段的
-output/max/expsum workspace 为 **193.5 MiB**，相对 16 段的 **12.094 MiB** 多用
-181.406 MiB，以固定 workspace 换取长上下文并行度。32K 下 32/64/128 段分别为
-348.634/479.021/288.647 µs，说明 segment 数与每段工作量、reduce 开销和 gfx936 驻留能力
-共同决定结果，256 是目标 24Q/4KV/head_dim=256 shape 的实测最优点。
+实机联合 sweep 覆盖 `BLOCK_M=8/16/32/64`、`TILE_SIZE=8/16/32` 和
+`segments=32/64/128/256`，并把 3D kernel 与 `reduce_segments` 一起捕获进 HIP Graph 测量。
+目标 BF16 shape 默认选择 `BM16/T16/S256`：相对此前全局继承的 `BM64/T16/S256`，
+4K/8K/16K/24K/32K 分别由 **0.133/0.173/0.245/0.314/0.393 ms** 降至
+**0.066/0.091/0.138/0.180/0.234 ms**，用时降低 **40.39%～50.56%**，输出逐 bit 一致。
+Qwen3.5-27B 的 GQA ratio 为 6；decode 只有一个 query token，BM64 的 `[64,256]` FP32
+accumulator 绝大部分行无效，而 BM16 显著降低寄存器压力。BM8 会令 `BLOCK_Q=1` 并产生额外
+无效 q-block，TILE32 也没有收益。256 段的 output/max/expsum workspace 为 **193.5 MiB**，
+以固定 workspace 换取长上下文并行度。按16个 full-attention 层估算，4K～32K 每个输出
+Token 可节省 **1.078～2.540 ms**；以约 47.48 ms/token 的 decode 用时为参照，16K 附近约
+贡献 **3.6% TPOT 收益**。
 
 ### Decode GEMV 与 MLP
 
@@ -271,8 +276,11 @@ Qwen3_5GatedDeltaNet
 | BLOCK_M | q_len=4096，context=4K，BM32→64 | 7.462 ms | 4.734 ms | 36.56% |
 | BLOCK_M | q_len=4096，context=16K，BM32→64 | 48.890 ms | 30.440 ms | 37.74% |
 | BLOCK_M | q_len=4096，context=32K，BM32→64 | 103.748 ms | 64.627 ms | 37.71% |
-| 3D segments | decode 24K，16→256 | 362.512 µs | 263.326 µs | 27.36% |
-| 3D segments | decode 32K，16→256 | 469.470 µs | 263.688 µs | 43.83% |
+| 3D联合配置 | decode 4K，BM64/T16/S256→BM16/T16/S256 | 0.133283 ms | 0.065901 ms | 50.56% |
+| 3D联合配置 | decode 8K，BM64/T16/S256→BM16/T16/S256 | 0.172849 ms | 0.091210 ms | 47.23% |
+| 3D联合配置 | decode 16K，BM64/T16/S256→BM16/T16/S256 | 0.244552 ms | 0.138272 ms | 43.46% |
+| 3D联合配置 | decode 24K，BM64/T16/S256→BM16/T16/S256 | 0.314414 ms | 0.180203 ms | 42.69% |
+| 3D联合配置 | decode 32K，BM64/T16/S256→BM16/T16/S256 | 0.393116 ms | 0.234344 ms | 40.39% |
 
 | History | paged UA | gather | suffix+prefix FA | LSE merge | gather+FA+merge | 用时降低 |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -328,9 +336,9 @@ Qwen3_5GatedDeltaNet
 
 | 阶段 | 优化点 / 提交 | 目标与生效条件 | 关键代码路径 | 软硬件依据 | 性能数据 |
 |---|---|---|---|---|---|
-| Full-attention | `BLOCK_M=64`（`9097a14`、`d56a55b`） | Unified Attention 长 prefill；GQA ratio≤16 | `_get_block_m -> UA2D` | 减少长 query 的 q-block program，换取寄存器压力 | q_len=4096、4K～32K：BM32→64 用时降低 36.6%～37.7%；2D decode 由 BM32 胜出 |
+| Full-attention | 2D `BLOCK_M=64`（`9097a14`、`d56a55b`） | Unified Attention 长 prefill；GQA ratio≤16 | `_get_block_m -> UA2D` | 减少长 query 的 q-block program，换取寄存器压力 | q_len=4096、4K～32K：BM32→64 用时降低 36.6%～37.7%；不再作用于3D decode |
 | Full-attention | prefill `TILE_SIZE=16`（`0a27664`） | 非 Gemma、纯 Triton prefill | `_get_tile_size -> UA2D` | 降低 head_dim=256 的 LDS 压力 | 约 2.6～2.8× kernel 加速 |
-| Decode attention | 3D softmax segments（`d10bbd2`、`d0b1ce1`） | 小 batch、长 context decode | `UA3D -> reduce_segments` | 以 segment 维扩展并行度 | 16→256：24K 用时降低 27.36%，32K 用时降低 43.83%；workspace 193.5 MiB |
+| Decode attention | 3D `BM16/T16/S256`（`d10bbd2`、`d0b1ce1`及联合调优） | BF16、小 batch、长 context decode | `_get_3d_block_m -> UA3D -> reduce_segments` | 以 segment 维扩展并行度，同时减少无效 accumulator 行和寄存器压力 | 相对 BM64/T16/S256，4K～32K kernel 用时降低 40.39%～50.56%；16K 预计贡献约3.6% TPOT；workspace 193.5 MiB |
 | Full-attention | 连续 FlashAttention prefill（`0ff997e`） | ROCm BF16/FP16、普通 causal full attention | `_forward_fa_prefill -> FA -> LSE merge` | 避开 paged 寻址与有数值问题的 paged FA | history 0～32K 相对 paged UA 用时降低 60.1%～65.1% |
 | Full-attention | 32K KV mirror + 30K hybrid route（`f958b91`） | 单请求、24Q/4KV/head=256 | `_forward_fa_prefill_mirror` | 用约 2 GiB 镜像换重复 gather | 8K～32K 用时降低 7.6%～15.6%；128 MiB/层 |
 | Decode GEMV | 通用 Strided-K + shape rows（`87eae58`、`9b1adfa`、`ee1e066`） | BF16/FP16、N=1、无 bias、K%8=0 | `rocm_unquantized_gemm -> LLMM_StridedK` | 合并 16-byte 读取，固定线程 grid-stride K | 七组目标 shape 相对 rocBLAS 为 -57.3%～+0.7%；最高 1450 GB/s |
