@@ -13,6 +13,7 @@
 
 - [一页结论](#一页结论)
 - [模型与瓶颈](#模型与瓶颈)
+- [四个性能模型](#四个性能模型)
 - [最终运行路径](#最终运行路径)
 - [Full-attention prefill](#full-attention-prefill)
 - [Decode attention](#decode-attention)
@@ -22,6 +23,7 @@
 - [统一优化方法](#统一优化方法)
 - [结果与证据](#结果与证据)
 - [环境、构建与回退](#环境构建与回退)
+- [关键提交索引](#关键提交索引)
 - [提交边界](#提交边界)
 
 ## 一页结论
@@ -113,6 +115,90 @@ ceil(783 / 16) x 16 = 784 tokens
   occupancy；
 - Triton 已经可以生成平台的 MMA/MFMA 路径，盲目从零手写通用 kernel 的
   风险高于在现有路径上做精确 gate。
+
+## 四个性能模型
+
+### 1. Chunked prefill：历史 gather 为什么会二次增长
+
+设 prompt 被切为 `n` 个等长 chunk，每个 chunk 有 `B` 个 tokens。通用
+gather + FA 路径在第 `i` 轮需要重新 gather 前面的 `iB` 个历史 tokens：
+
+```text
+total_history_gather
+  = B x (0 + 1 + ... + n-1)
+  = B x n(n-1) / 2
+```
+
+KV mirror 每个 token 只在首次产生时 append 一次：
+
+```text
+total_mirror_append = B x n
+```
+
+以 32K prompt、4K chunk 为例，`n=8`：
+
+```text
+without mirror: 4K x (0+1+...+7) = 112K token copies/layer
+with mirror:    4K x 8           = 32K token copies/layer
+```
+
+因此 mirror 将这部分 KV 搬运从随 chunk 数二次增长，改为随总 token 数线性
+增长。实际加速低于 `112/32=3.5x`，因为 FlashAttention 计算、Q/O 读写和框架
+开销仍然存在；但序列越长，消除重复 history gather 的价值越高。
+
+### 2. 3D decode：并行度和归约成本的平衡
+
+低并发目标中，2D attention 的 producer 数近似：
+
+```text
+CTA_2D ~= num_sequences x 4 KV heads
+```
+
+3D kernel 加入 `S` 个 KV segments 后：
+
+```text
+CTA_3D ~= num_sequences x 4 KV heads x S
+work_per_CTA ~= context_len / S
+```
+
+`S=256` 时，单请求就能产生约 1024 个 producer CTAs，显著增加长 KV 扫描的
+可调度并行度。但 reducer 的输入、workspace 和 launch work 也近似随 S 增长。
+所以 segments 不是越大越好；最终 S256 是 producer 并行度、每 CTA 扫描长度、
+193.5 MiB workspace 和 reduce 开销的联合最优点。
+
+### 3. BF16 GEMV：为什么目标是带宽而不是 FLOPs
+
+对 `N=1`、权重为 `[M,K]` 的 BF16 GEMV，忽略很小的 input/output：
+
+```text
+FLOPs       ~= 2 x M x K
+weight bytes = 2 x M x K
+arithmetic intensity ~= 1 FLOP/byte
+```
+
+这远低于大 GEMM 的算术强度，matrix core 峰值不是主要上限。性能近似由：
+
+```text
+time >= weight_bytes / effective_HBM_bandwidth
+```
+
+决定。因此 Strided-K 的核心指标是连续读取、活跃 wave、独立 memory requests
+和实测 GB/s，而不是增加更多矩阵指令。PPT 中多个 K=5120 shape 达到约
+1413-1450 GB/s，即接近该平台实测带宽上限的 90%，也解释了后续调参收益开始
+收敛。
+
+### 4. GDN：小 kernel 收益为什么值得做
+
+GDN 的单层绝对用时不如大 GEMM 显眼，但模型中有 48 层。若某个 stage 每层
+节省 `delta_t`，一次完整 forward 的理论上限贡献近似：
+
+```text
+delta_forward <= 48 x delta_t
+```
+
+这也是为什么 state h、output o、metadata 和 D2D copy 都值得单独优化。反过来，
+任何增加一次临时分配、同步或错误 autotune 的代价也会重复 48 次。GDN 优化
+优先减少固定开销和重复数据流，再调单 kernel 的 warps/stages。
 
 ## 最终运行路径
 
@@ -609,6 +695,7 @@ export VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS=256
 export VLLM_TRITON_FA_PREFILL=1
 export VLLM_TRITON_FA_PREFILL_MIRROR_CAPACITY=32768
 export VLLM_TRITON_FA_PREFILL_FULL_KV_THRESHOLD=30720
+export VLLM_ROCM_USE_SKINNY_GEMM=True
 export VLLM_ROCM_STRIDED_GEMV=True
 ```
 
@@ -639,6 +726,25 @@ python -m pip install --force-reinstall --no-deps dist/vllm-*.whl
 
 这种 fail-closed 设计保证优化是可撤回的：关闭变量或不满足 gate 时，模型
 仍使用原始正确路径，而不是产生未定义结果。
+
+## 关键提交索引
+
+| 主题 | 关键提交 | 作用 |
+| --- | --- | --- |
+| Baseline | `01d6aad` | 导入 SourceFind/OpenDAS v0.18.1 快照 |
+| UA 2D BM64 | `9097a14`、`d56a55b` | 长 prefill/fallback 的 M tile；改为运行时配置 |
+| UA prefill TILE16 | `0a27664` | gfx936 head256 的 LDS/occupancy 调优 |
+| 3D decode | `d10bbd2`、`d0b1ce1`、`11c7f44` | segments 探索及最终 BM16/T16/S256 独立配置 |
+| 连续 FA prefill | `0ff997e` | current causal FA + history FA + LSE merge |
+| KV mirror | `f958b91` | 单请求逐层连续 K/V 与 30K hybrid route |
+| Strided-K | `87eae58`、`9b1adfa`、`ee1e066` | 新 kernel、rows 选择与 fallback |
+| FP32 reduction | `2f151cc` | gfx936 BF16 GEMV 的精度和性能修正 |
+| K5120/640 threads | `be6637e` | 640 个 16-byte chunks 与 wave64 对齐 |
+| gate_up + SwiGLU | `13639b4` | 单 token MLP 融合 |
+| down / LM head | `4d411c5`、`eb40282` | rows=1/1024-thread 与 rows=2 专用路由 |
+| Prefill MLP | `da496ba`、`3a2d060` | rocBLAS solution 20980/20981 |
+| GDN prefill | `97869b0`、`8bf1196` | gfx936 workload bucket、直写和 indices 复用 |
+| GDN warmup | `f916d70`、`442994b` | profile 阶段预编译长上下文 specialization |
 
 ## 提交边界
 
