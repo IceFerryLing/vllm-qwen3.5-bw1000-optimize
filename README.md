@@ -1,387 +1,677 @@
-# Qwen3.5 vLLM Contest Fork
+# Qwen3.5 vLLM 国产加速卡推理优化
 
-本仓库用于 2026 先导杯「基于国产加速卡的千问大模型推理服务优化」。基础代码来自
-SourceFind/OpenDAS vLLM v0.18.1，目标环境是国产 DCU/BW1000（`gfx936`）上的
-Qwen3.5-27B BF16 单卡在线推理。
+本仓库是面向 2026 先导杯「基于国产加速卡的千问大模型推理服务优化」的
+`submit/v3.0` 提交线。基础代码来自 SourceFind/OpenDAS vLLM 0.18.1，目标
+环境是国产 DCU/BW1000（`gfx936`）上的 Qwen3.5-27B BF16 单卡在线推理。
 
-本项目的分支信息如下：
+这份 README 说明最终提交中各项优化的**运行原理、代码路径、触发条件、性能
+证据和代价**。微基准数据来自目标机器；它们用于解释单项机制，不能把所有
+百分比直接相加为端到端收益。PPT 中的图经过整理后保存在
+[`docs/assets/contest-optimization`](docs/assets/contest-optimization) 中。
 
-- `develop` 是日常研究分支。
-- `submit/vN` 是比赛提交线。
+## 目录
 
-因此，`develop` 上出现过的代码不一定进入 `submit/vx.x`，`submit/vx.x` 的后续优化也不一定
-回合并到 `develop`。
-在gitlab上，`develop`分支被更名为`workspace`。
+- [一页结论](#一页结论)
+- [模型与瓶颈](#模型与瓶颈)
+- [最终运行路径](#最终运行路径)
+- [Full-attention prefill](#full-attention-prefill)
+- [Decode attention](#decode-attention)
+- [Decode GEMV 与 MLP](#decode-gemv-与-mlp)
+- [Prefill MLP](#prefill-mlp)
+- [GDN prefill](#gdn-prefill)
+- [统一优化方法](#统一优化方法)
+- [结果与证据](#结果与证据)
+- [环境、构建与回退](#环境构建与回退)
+- [提交边界](#提交边界)
 
-## 优化思路简述
+## 一页结论
 
-调研技术方案后，团队认为vllm 0.18.1 是一个非常关键的信息，这个版本号非常新，以至于团队相信，
-大部分通用性优化vllm社区都应该已经制作。
+我们的方案没有重写一套通用 vLLM，而是采用 `Tune -> Route -> Fuse/Remove`
+的窄门控策略：
 
-早期调研发现，Qwen 3.5 的 hybrid KV cache 会对 attention page 与 GDN state page
-进行大小和 chunk 对齐，在目标配置下会将 attention 的 `BLOCK_SIZE` 计算为 784。另一方面，
-在未启用 AITER unified attention、AITER MHA 或 prefill/decode split backend 时，ROCm 平台级
-的 backend 优先级会默认回退到 Triton unified attention。这两个机制相互独立：前者产生
-非典型的大 page 形状，后者决定 full-attention 层的默认 backend。对初赛纯文本的
-full-attention prefill，实测发现在满足语义和 shape 约束时，将 K/V 转为连续布局后使用
-non-paged FlashAttention 比通用的 paged unified attention 更快。此外，线性注意力区有各种
-小 kernel，进一步拖累了整个模型的计算。
+1. **Tune**：按真实 backend、shape、dtype 和 gfx936 资源约束调
+   `BLOCK_M`、`TILE_SIZE`、warps、stages、segments 和 GEMV rows。
+2. **Route**：让已经存在但没有被平台或模型 shape 选中的快速路径命中，例如
+   non-paged FlashAttention、LLMM1/Strided-K 和固定 rocBLAS solution。
+3. **Fuse/Remove**：融合 `gate_up GEMV + SwiGLU`，让 GDN output 直接写最终
+   地址，并复用 chunk metadata，删除中间 tensor、D2D copy 和重复 launch。
 
-最初团队认为，可能这个vllm在DCU上只是“能跑”的水准，但是团队拿到真实算力平台后，采样Triton JIT
-IR 发现，Triton编译器甚至能编译并使用builtin MMA能力，利用上DCU自身的matrix core，外加长期
-优化不顺，我们最终判定，哪怕是通用优化，triton编译器在这个平台上也已经做的足够好──以至于不能盲目
-手写custom kernel。事实上JIT技术也能拿到更多平台运行时信息，手写算子也难以调参，更不能搬迁NVIDIA
-经验。
+最终提交覆盖六条互补路径：
 
-所以关键点是：1.怎么让Triton kernel跑的更快，在这个模型和平台上表现更好？2.能不能通过
-custom kernel实现自定义快速算子（后来证明难度很高且投入产出比低）；3.能不能想办法开启因为各种原因最
-终没有被选中的快速算子，从而绕开某些算子过于通用而不快的问题？
+| 阶段 | 主要问题 | 最终解法 |
+| --- | --- | --- |
+| Full-attention prefill | paged KV 的 block-table 查询和非连续 gather | 连续 FlashAttention；单请求再维护增量 KV mirror |
+| Triton UA fallback | 长 query 的 q-block 和 tile 形状不合适 | 2D `BLOCK_M=64`，prefill `TILE_SIZE=16` |
+| Decode attention | 只有 4 个 KV heads，2D grid 并行度不足 | 3D KV segment + LSE reduce，`BM16/T16/S256` |
+| Decode GEMV | `N=1`、大 K 的带宽受限矩阵向量乘 | Strided-K、FP32 `fmaf`、640 threads 和 shape rows |
+| Decode MLP | gate/up 中间量和 activation launch | 单 token `gate_up + SwiGLU` 融合 |
+| GDN / prefill MLP | 48 层重复小 kernel、4096-token GEMM 未命中最佳解 | gfx936 workload bucket、output 直写、indices 复用、固定 rocBLAS solution |
 
-对于1，我们通过利用AI工作流调整参数解决，比如调参BLOCK_M、TILE_SIZE，以及通过微调相关算子代码解决
-，比如线性注意力区投影的各种GEMV算子代码微调；对于3，我们先是通过将gfx936加入编译白名单，从而让其能
-够命中 LLGemm 算子，然后在 Triton backend 内为满足约束的 full-attention prefill 增加
-non-paged FlashAttention 快路径：当前 chunk 执行 causal FlashAttention，历史 K/V 从 paged
-cache gather 到连续 workspace 后执行 prefix attention，各段结果再通过 LSE merge 合并；
-decode 仍保持 Triton paged attention 路径。这减少了实际代码量，同时带来了巨大的吞吐提升，
-因为这个系统本来就拥有由于模型形状和平台检查而未被选中的快速路径。
+这些优化分别作用于不同时间段：prefill 主要改善 TTFT，decode 主要改善
+TPOT，GDN 和 MLP 则在每层 forward 中重复贡献。它们可以在最终提交中组合，
+但每个候选仍按单项 A/B、正确性、SLA 和 accuracy 逐项闭环。
 
-所有优化都和profile证据息息相关，尽管对hipprof工具的错误使用也产生了错误决策，但我们团队依然坚持
-以实际证据为主。事实上，我们团队最终能摸清到底哪些路径主导了整个流程，正是依靠AI profile工作流传回
-来的相关信息。
+## 模型与瓶颈
 
-## AI 辅助优化工作流 （ AI披露 ）
-
-`develop` 主要把 AI 辅助优化固化成了一套流程：
+Qwen3.5-27B 的语言模块由 64 层组成，每四层为一个周期：
 
 ```text
-读取 AGENTS.md、目标 config.json 和比赛规则
-                    |
-                    v
-建立干净 baseline，记录源码、wheel、环境和三档结果
-                    |
-                    v
-只抓服务期的短 profile，区分 prefill / decode 与实际 backend
-                    |
-                    v
-锁定热点 kernel、真实 shape、数据类型和 fallback
-                    |
-                    v
-实现数学等价、带精确 gate 和回退路径的小 patch
-                    |
-                    v
-干净源码构建 wheel -> 安装 -> import/JIT/kernel correctness
-                    |
-                    v
-官方 run_throughput.sh 三档 A/B + SLA + accuracy
-             /                              \
-            v                                v
-  收益不稳定或风险过高：回滚          收益稳定：合规审查和计分
-                                             |
-                                             v
-                                  重放到 submit/vN 专门提交到测评机
+48 layers Gated DeltaNet (GDN) + 16 layers Gated Full Attention
 ```
 
-项目专用 skills 对应这个闭环的四个阶段：
+- GDN：16 个 Q/K heads、48 个 V heads、head dimension 128；状态是 chunked
+  recurrent state，prefill 会执行大量小型 Triton kernel。
+- Full attention：24 个 query heads、4 个 KV heads，即 GQA ratio 6，head
+  dimension 256；KV cache 为 paged layout。
+- hidden size：5120；MLP intermediate size：17408；padded vocabulary：248320。
+- 评测上下文档位：4-8K、8-16K、16-32K；decode 是单 token、低并发路径。
 
-| Skill | 职责 | 主要产物 |
-|---|---|---|
-| [`scnet-vllm-baseline`]| 建立、恢复和验证干净 baseline | source/wheel 记录、三档 `result.json`、accuracy、canonical baseline index |
-| [`dcu-hipprof-profile`] | 在 DCU 容器抓取短服务期 profile | 热 kernel、prefill/decode 分类、Triton/AITER/`_rocm_C`/fallback 证据 |
-| [`vllm-diff-compliance`] | 按比赛技术方案审查 patch | BLOCKER/HIGH RISK/NEEDS EVIDENCE/OK 结论 |
-| [`pra26-score`]| 计算三档吞吐、SLA 和四类准确率对总分的影响 | 确定性得分与优化优先级 |
+![Qwen3.5 的层结构与热点](docs/assets/contest-optimization/model-hotspots.png)
 
-全局边界由 [`AGENTS.md`](AGENTS.md) 约束，包括分支与 remote 语义、wheel 构建契约、远端工作区清洁检查、模型与 cache 位置、SCNet 容器操作、profile 有效性、官方 benchmark 边界、合规红线和提交前证据。代码部分也由AI生成后人工review，降低代码迭代成本。
+图中三个热点的含义：
 
-## 各项优化措施及其对性能的提升
+1. **GDN chunk prefill** 在 48 层重复出现，小的单算子收益会被层数放大。
+2. **GQA full attention** 运行在非典型 page size 784 的 paged KV 上，地址
+   解析、非连续 gather 和重复读取会抵消矩阵单元的计算能力。
+3. **GEMM/GEMV** 在 MLP、GDN 投影和 LM head 中反复出现；decode 的 `N=1`
+   使算子更接近带宽测试而不是高算术强度 GEMM。
 
-### 软硬件约束与热点来源
+### 为什么 page size 是 784
 
-Qwen 官方模型卡给出的 Qwen3.5-27B 语言模型结构是 64 层
-`16 × (3 × Gated DeltaNet + 1 × Gated Attention)`：48 层是 GDN 线性注意力，
-16 层是 full attention。GDN 使用 16 个 Q/K heads、48 个 V heads，head dimension
-均为 128；full attention 使用 24 个 Q heads、4 个 KV heads，head dimension 为 256。
-模型 hidden size 为 5120，MLP intermediate size 为 17408，padded vocabulary 为
-248320。官方模型支持更长上下文，但本次比赛工作负载只覆盖到 32K。
-
-这些形状把热点分成三组：48 次重复执行的 GDN chunk prefill；16 层在非典型
-`BLOCK_SIZE=784` paged KV 上运行的 GQA full attention；以及每层 MLP、GDN 投影和
-LM head 中的 GEMM/GEMV。Prefill 主要处理大矩阵和长序列 attention，decode 则反复执行
-`N=1` 的带宽受限 GEMV。
-
-因此，考虑方向为：
-
-- 当前 kernel 按 wave64 组织 shuffle、reduction 和线程块，线程数必须考虑 64-lane wave 对齐。
-- `N=1` GEMV 算术强度低，关键是形成合并的 16-byte 权重读取并产生足够多的独立 HBM 请求。
-- Unified Attention 的 Q、K/V tile 和 FP32 accumulator 会共同占用寄存器与 LDS；tile 过大
-  会降低驻留 wave 数，难以隐藏 paged-KV 访存停顿。
-- 当前实现记录 gfx936 没有适合该路径的 packed BF16 dot/FMA；模拟 `__hfma2` 会增加指令并在
-  每个 pair 后舍入，因此 BF16 GEMV 改为 FP32 `fmaf` 累加。
-- Triton 已能在平台上生成矩阵计算代码，主要问题是针对真实shape 选择 block/warp/stage、避免短序
-  列 autotune 污染，以及在首个真实请求前完成 JIT。
-
-
-### Full-attention prefill
-
-1. **Unified Attention 2D `BLOCK_M=64`。**
-   [`unified_attention`](vllm/v1/attention/ops/triton_unified_attention.py) 将同一 KV head 下的
-   “query token × GQA query head”展平到 M 维，再通过
-   `BLOCK_Q = BLOCK_M // num_queries_per_kv` 决定一个 program 覆盖的 query token 数。
-   对目标 `24Q/4KV`，提高 `BLOCK_M` 能在长 query 下减少 q-block program 数，让更多 query
-   rows 复用 block-table 寻址和 K/V tile 循环；代价是更大的 Q/softmax/accumulator 状态及
-   更高寄存器压力。`d56a55b` 后该值在运行时读取，默认 64，且当前只作用于2D kernel。gfx936 单卡微基准表明，这一选择
-   明确面向长 query：q_len=4096 时，BM32→BM64 在 4K/16K/32K context 分别由
-   **7.462→4.734 ms、48.890→30.440 ms、103.748→64.627 ms**，用时降低
-   **36.6%～37.7%**；q_len=1 的纯 2D UA 中则是 BM32 最快，4K/16K/32K 分别为
-   **0.514/2.021/4.031 ms**，BM64 为 **0.573/2.251/4.485 ms**。因此 BM64 是纯
-   Triton 长 prefill 的 shape specialization，不是 decode 的通用最优值。3D decode 已拆出默认
-   `BLOCK_M=16` 的独立环境变量，不会再继承2D配置。满足条件的 Qwen3.5
-   prefill 默认走后述 FlashAttention 路径，BM64 主要覆盖 Triton 回退和其他 UA prefill 场景。
-
-2. **Prefill `TILE_SIZE=16`。**
-   `_get_tile_size` 为非 Gemma 的 Unified Attention prefill 返回环境变量配置。源码记录
-   gfx936、`head_dim=256` 下，32-token tile 会因 LDS 压力只保留约 1 wave/SIMD；降到 16 后
-   可达到约 2 waves/SIMD，目标 kernel 实测约 **2.6～2.8×**。这项数据只代表纯 Triton
-   Unified Attention kernel，不代表默认 FA prefill 的端到端收益。
-
-3. **把 full-attention prefill 路由到连续 FlashAttention。**
-   关键路径为
-   `TritonAttentionImpl.forward -> _forward_fa_prefill -> flash_attn_varlen_func -> merge_attn_states`。
-   当前 chunk 直接在连续 K/V 上做 causal FA；历史 K/V 从 paged cache 分块 gather 到连续
-   workspace，做 non-causal prefix attention，再通过 LSE 合并。它既绕开 gfx936 上有数值问题的
-   paged FA 路径，也避免让通用 Unified Attention 直接承担目标纯文本 prefill。该路由只在 ROCm、
-   FP16/BF16、普通 decoder full attention、无 sliding-window/ALiBi/sink/softcap/MM prefix 等
-   语义扩展时启用；依赖不可导入或条件不满足时回退 Triton。4096-token query chunk 下，history
-   从 0 增至 32K 时，该路径相对 paged UA 的总延迟降幅稳定在 **60.1%～65.1%**。
-
-4. **单请求连续 K/V 镜像与混合 FA 路由。**
-   `_forward_fa_prefill_mirror` 为目标 `24Q/4KV/head_dim=256` 的每个 full-attention 层维护
-   连续镜像，chunked prefill 只追加本轮 K/V，避免每轮重新 gather 全部前缀。序列不超过
-   30K 时执行一次 full-KV causal FA；30K～32K 时执行当前 chunk causal FA、历史 non-causal FA
-   和 LSE merge；超过容量或状态不连续时回退通用 gather 路径。BF16 下 32K 镜像约为
-   **128 MiB/层**，按 16 个 full-attention 层约 **2 GiB/卡**，这是用显存换重复 gather 的减少。
-   8K～32K 的稳态 chunked-prefill 微基准显示，镜像总延迟降低 **7.6%～15.6%**；追加当前
-   4096-token K/V 只需约 **0.031 ms**，收益主要来自消除随 history 增长到
-   **0.412～2.807 ms** 的 paged-cache gather。
-
-### Decode attention
-
-低并发 decode 的 2D grid 只有 `num_sequences × num_kv_heads` 量级，目标模型只有 4 个 KV heads，
-长上下文时无法充分利用。3D kernel 将 KV 序列切成多个 segment，分别写出局部
-output/max/expsum，再由 `reduce_segments` 合并。
-
-实机联合 sweep 覆盖 `BLOCK_M=8/16/32/64`、`TILE_SIZE=8/16/32` 和
-`segments=32/64/128/256`，并把 3D kernel 与 `reduce_segments` 一起捕获进 HIP Graph 测量。
-目标 BF16 shape 默认选择 `BM16/T16/S256`：相对此前全局继承的 `BM64/T16/S256`，
-4K/8K/16K/24K/32K 分别由 **0.133/0.173/0.245/0.314/0.393 ms** 降至
-**0.066/0.091/0.138/0.180/0.234 ms**，用时降低 **40.39%～50.56%**，输出逐 bit 一致。
-Qwen3.5-27B 的 GQA ratio 为 6；decode 只有一个 query token，BM64 的 `[64,256]` FP32
-accumulator 绝大部分行无效，而 BM16 显著降低寄存器压力。BM8 会令 `BLOCK_Q=1` 并产生额外
-无效 q-block，TILE32 也没有收益。256 段的 output/max/expsum workspace 为 **193.5 MiB**，
-以固定 workspace 换取长上下文并行度。按16个 full-attention 层估算，4K～32K 每个输出
-Token 可节省 **1.078～2.540 ms**；以约 47.48 ms/token 的 decode 用时为参照，16K 附近约
-贡献 **3.6% TPOT 收益**。
-
-### Decode GEMV 与 MLP
-
-`f93a2de` 先让 gfx936 进入 gfx9 skinny-GEMM 路由，`ab94c4b` 恢复 `_rocm_C` 扩展构建，
-为后续 kernel 随 wheel 交付提供基础。这两项属于使能条件，不单独归因性能。
-
-1. **Strided-K `N=1` GEMV。**
-   路径为 `Qwen3.5 Linear -> rocm_unquantized_gemm -> shape gate -> LLMM_StridedK`。
-   相比 LLMM1 按 K 增长线程数，Strided-K 让固定规模线程沿 K 的 8-element/16-byte chunk
-   grid-stride，改善合并访存和 occupancy，并支持 `K>8192`。提交和源码记录在 gate_up、
-   qkvz、qkv、LM head、o_proj 等目标投影上，相对 LLMM1 的 HBM 带宽提升约 **7%～20%**。
-   `rows_per_block` 按 M/K shape 选择，未命中时仍回退 LLMM1 或通用 linear。早期测试还记录
-   `K=17408` down projection 的 rocBLAS 路径已达到约 **91% 峰值带宽**，因此最初没有用通用
-   Strided-K 强行替换；后续才为该精确 shape 增加 rows=1/1024-thread 专用实现。
-
-2. **BF16 改用 FP32 累加。**
-   gfx936 路径把 BF16 pair 转为 FP32 后逐项 `fmaf`，替代由 `__hip_bfloat162` 模拟的 packed
-   BF16 FMA。这既减少模拟指令，也避免每两个乘积就舍入；测试用更严格阈值与 rocBLAS 结果比较。
-   在 `[16384,5120]` 上，当前 Strided-K 相对 rocBLAS 的 rel-L2 为 **1.88e-5**，旧 LLMM1
-   为 **3.47e-3**；在 `[8192,5120]` 上分别为 **3.05e-6** 与 **3.45e-3**，验证了长 reduction
-   中 FP32 累加的精度价值。
-
-3. **`K=5120` 的 640-thread 配置。**
-   5120 个 BF16 元素恰好形成 640 个 16-byte chunk；在 wave64 上使用 640 线程可让每个线程
-   读取一个连续 chunk，避免通用 128-thread 配置的五轮 grid-stride。源码记录 gate/qkv 大投影
-   约有 **9%～10%** 提升。standalone kernel 在 M=16384/34816/248320 上相对 128 threads
-   分别由 **142.245→128.453 µs、299.552→270.662 µs、2.103→1.910 ms**，用时降低
-   **9.2%～9.7%**，输出逐 bit 相同。
-
-4. **融合 gate_up GEMV 与 SwiGLU。**
-   `Qwen3_5MLP.forward -> rocm_unquantized_silu_mul -> LLMM_SiluMul` 同时计算对应 gate/up 行，
-   直接输出 `[1,17408]`，避免物化 `[1,34816]` gate_up tensor 和单独 activation kernel。
-   仅在 TP=1、BF16、无量化、无 LoRA、目标 shape且连续布局下命中。目标 shape 上，未融合的
-   Strided-K+SwiGLU 为 **261.489 µs**，融合后为**247.957 µs**，用时降低 **5.17%**，结果逐 bit 相同。
-
-5. **Decode down projection 专用 kernel。**
-   对 `[M,K]=[5120,17408]` 使用 rows=1、1024 threads，每个 block 负责一个输出行并遍历
-   2176 个连续 16-byte chunk。它用更多独立 HBM 请求替代通用 rows=8/128-thread 配置，同时
-   避免重复读权重。已构建 rows=8 参考实现为 **151.280 µs**，rocBLAS 为
-   **150.309 µs**；当前源码将该精确 shape 收窄到 rows=1/1024-thread 实现，避免把这一策略
-   扩散到其他 K>8192 shape。
-
-6. **LM head 专用路由。**
-   将 gfx936 BF16 `[248320,5120]` 从 LLMM1 rows=8 改为 Strided-K rows=2；其他大词表
-   shape 继续走原路径，避免把单一模型的结论泛化。目标 LM head 上 rocBLAS、LLMM1 rows=8、
-   Strided-K rows=2 分别为 **1.905/2.403/1.754 ms**；rows=2 相对 rocBLAS 用时降低 **7.93%**，
-   相对 LLMM1 用时降低 **27.03%**。
-
-### Prefill MLP GEMM
-
-4096-token prefill 的矩阵已经足够大，手写 GEMV 不再合适，因此直接使用 rocBLAS 的目标
-solution：down projection `[4096,17408] × [17408,5120]` 固定 solution 20980，gate_up
-`[4096,5120] × [5120,34816]` 固定 solution 20981。路由严格限制到 gfx936、BF16、无 bias、
-连续 tensor 和精确 shape，并与默认 `torch.nn.functional.linear` 做逐 bit 一致性测试。
-solution 20980 将 down projection 从 **2.460 ms / 296.8 TFLOPS** 提升到
-**2.374 ms / 307.6 TFLOPS**，用时降低 **3.51%**；solution 20981 将 gate_up 从
-**4.375 ms / 333.8 TFLOPS** 提升到 **4.086 ms / 357.4 TFLOPS**，用时降低 **6.60%**。
-两项输出均与默认 solution 逐 bit 相同。
-
-### GDN prefill 与首次请求 JIT
-
-Qwen3.5-27B 有 48 个 GDN 层，单次小收益会在每次 forward 中重复 48 次。Chunked GDN prefill
-的关键链路是：
+Qwen3.5 的 hybrid KV cache 要同时容纳 full-attention 的 KV 和 GDN state。
+attention 每 token 的 KV 存储为：
 
 ```text
-Qwen3_5GatedDeltaNet
-  -> chunk_gated_delta_rule
-  -> recompute_w_u_fwd
+4 KV heads x 256 head_dim x 2 bytes x 2 tensors (K + V)
+  = 4096 bytes/token
+```
+
+目标 GDN state 的原始大小约为 `3,207,168 bytes`，对应：
+
+```text
+3,207,168 / 4,096 = 783 tokens
+```
+
+cache manager 又按 16-token chunk 对齐：
+
+```text
+ceil(783 / 16) x 16 = 784 tokens
+```
+
+因此 784 不是 attention kernel 自己选择的常规 tile，而是 hybrid cache 对齐
+产生的物理 page 形状。它带来容量利用率，却让通用 paged attention 的 tile
+很难同时满足 power-of-two 矩阵布局和不跨页寻址。
+
+![Hybrid cache 与 784-token page 的形成](docs/assets/contest-optimization/hybrid-cache-page-784.png)
+
+### BW1000/gfx936 的关键硬件约束
+
+- wave64 下，线程数和 reduction 需要考虑 64-lane 对齐；
+- full attention 的 head dimension 256 会让 Q、K/V tile、softmax 统计量和
+  FP32 accumulator 同时占用 LDS/VGPR；
+- GEMV 的算术强度低，性能取决于连续 16-byte HBM 读取、独立请求数和
+  occupancy；
+- Triton 已经可以生成平台的 MMA/MFMA 路径，盲目从零手写通用 kernel 的
+  风险高于在现有路径上做精确 gate。
+
+## 最终运行路径
+
+把提交版看成两条时间轴会更容易理解：
+
+```text
+Prefill (num_scheduled_tokens > 1)
+  -> standard full attention + FA gate
+       -> continuous FA (current chunk causal + history prefix)
+       -> Qwen3.5 single-request KV mirror (when state is continuous)
+       -> otherwise paged gather + FA + LSE merge
+       -> unsupported semantics -> Triton Unified Attention 2D
+
+Decode (num_scheduled_tokens == 1)
+  -> Triton Unified Attention 3D
+       -> KV segments -> partial output/max/expsum -> reduce_segments
+  -> Qwen3.5 Linear shape gate
+       -> Strided-K / rows specialization / fused SwiGLU
+       -> otherwise LLMM1 or torch/rocBLAS fallback
+
+GDN prefill
+  -> gfx936 shape/NT bucket -> fixed Triton configuration
+  -> profile warmup before KV-cache allocation
+```
+
+路由是互斥的：不能把连续 FA 的 prefill 时间与 paged UA 的时间相加，也不能
+把 decode 3D segment 的收益当作 prefill 收益。所有 gate 失败都会回退到原有
+实现，避免将 Qwen3.5 的结论扩散到其他模型。
+
+## Full-attention prefill
+
+### 1. Triton Unified Attention 的长 query 调参
+
+代码：[`triton_unified_attention.py`](vllm/v1/attention/ops/triton_unified_attention.py)。
+
+2D kernel 将同一个 KV head 下的 `(query token, query head)` 展平到 M 维：
+
+```text
+BLOCK_Q = BLOCK_M // num_queries_per_kv
+```
+
+对目标 GQA6，`BLOCK_M=64` 大约覆盖 10 个 query tokens。长 query 时，较大的
+M tile 可以：
+
+- 减少 q-block program 数；
+- 在更多 query rows 之间摊薄 block-table 查询和 K/V tile 循环；
+- 提高一次 K/V tile 对 Q rows 的复用。
+
+代价是 Q 和 FP32 accumulator 更大，尾部 mask 更多，VGPR/LDS 压力更高。这个
+选择只针对 2D prefill/fallback；3D decode 有独立的 `BLOCK_M=16`，不会继承
+BM64。需要特别说明：GQA6 不能整除 64，`64 // 6 = 10` 的最后几行仍属于
+通用映射的尾部工作，因此默认目标 prefill 优先走下面的连续 FA 路径，而不是
+把 BM64 当作所有 GQA6 的完美映射。
+
+目标机纯 Triton UA 微基准（q_len=4096）：
+
+| context | BM32 | BM64 | 用时降低 |
+| ---: | ---: | ---: | ---: |
+| 4K | 7.462 ms | 4.734 ms | 36.56% |
+| 16K | 48.890 ms | 30.440 ms | 37.74% |
+| 32K | 103.748 ms | 64.627 ms | 37.71% |
+
+q_len=1 时 BM32 反而更快，所以 BM64 是长 prefill specialization，不是 decode
+默认值。
+
+### 2. `TILE_SIZE=16`：用 occupancy 换单次 tile 宽度
+
+在 head dimension 256 下，一个 UA program 需要同时保留：
+
+```text
+Q tile + K/V tile + score/softmax statistics + FP32 accumulator
+```
+
+`TILE_SIZE=32` 会提高 LDS 和寄存器占用，在 gfx936 上约只能保持 1 wave/SIMD；
+降到 16 后约可保持 2 waves/SIMD，能更好地隐藏 paged KV 的 HBM 延迟。纯
+Triton UA kernel 的实测加速约 2.6-2.8x。该数据不等于默认 FA 路径的端到端
+加速，但说明为什么 fallback 必须独立调参。
+
+### 3. 连续 FlashAttention：先整理地址，再使用矩阵路径
+
+代码入口：[`triton_attn.py`](vllm/v1/attention/backends/triton_attn.py)。
+
+通用 paged UA 的主要额外工作是：每个 query block 读取 block table，计算物理
+page 地址，再从碎片化 KV 中 gather。我们的 FA prefill 路径把工作拆成：
+
+```text
+current K/V -> contiguous causal FlashAttention
+history KV  -> paged gather to contiguous workspace
+history     -> non-causal FlashAttention
+two states  -> exact LSE merge
+```
+
+当前 chunk 的 attention 是 causal 的，历史 prefix 对当前 query 已经全部可见，
+所以历史 attention 可以用 non-causal FA。两部分分别得到输出 `O` 和 log-sum-exp
+`LSE`，合并公式为：
+
+```text
+L = logaddexp(LSE_history, LSE_current)
+O = exp(LSE_history - L) * O_history
+  + exp(LSE_current - L) * O_current
+```
+
+该公式避免构造完整 score/probability 矩阵，同时保持 softmax 语义。它将 paged
+访问集中到一次 gather，把主要 QK/PV 计算交给连续地址的 FlashAttention/MFMA
+路径。
+
+![连续 FlashAttention 的 prefill 路径](docs/assets/contest-optimization/continuous-fa-prefill.png)
+
+目标机 history 0-32K 的总延迟对比：
+
+| history | paged UA | gather + FA + merge | 用时降低 |
+| ---: | ---: | ---: | ---: |
+| 0 | 4.726 ms | 1.650 ms | 65.08% |
+| 4K | 13.294 ms | 5.301 ms | 60.12% |
+| 8K | 21.897 ms | 8.365 ms | 61.80% |
+| 16K | 38.997 ms | 14.464 ms | 62.91% |
+| 24K | 56.095 ms | 20.561 ms | 63.35% |
+| 32K | 73.210 ms | 26.664 ms | 63.58% |
+
+FA gate 只在 ROCm、BF16/FP16、普通 decoder full attention、无 sliding window、
+ALiBi、sinks、softcap、multimodal prefix 等扩展时启用；FlashAttention 不可
+导入或语义条件不满足就回退 Triton UA。
+
+### 4. 单请求增量 KV mirror：消除重复历史 gather
+
+仅有 gather + FA 时，chunked prefill 每增加一个 4K chunk，都可能重新 gather
+全部历史 prefix：
+
+```text
+chunk 1: gather 0K
+chunk 2: gather 4K
+chunk 3: gather 8K
+chunk 4: gather 12K
+```
+
+在单请求、连续 chunk 的条件下，`_forward_fa_prefill_mirror` 为每个 full-
+attention 层维护连续 K/V：首次写入当前 KV，后续只 append 新 token；历史
+prefix 不再重复从 paged cache 读取。镜像长度与 context length 不一致、请求
+超出容量或 chunk 不连续时，镜像立即失效并回退通用路径。
+
+![增量 K/V mirror 的 chunk 生命周期](docs/assets/contest-optimization/kv-mirror.png)
+
+显存代价可以直接计算：
+
+```text
+32,768 tokens x 4 KV heads x 256 dim x 2 bytes x (K + V)
+  = 128 MiB / full-attention layer
+128 MiB x 16 full-attention layers ~= 2 GiB / card
+```
+
+这是明确的空间换时间：在 8K-32K 稳态 chunked-prefill 微基准中，总延迟降低
+约 7.6%-15.6%，但 KV 可用容量减少，必须纳入显存和最大上下文预算。
+
+镜像有两个 attention 组织方式：
+
+- `seq_len <= 30,720`：一次 full-KV causal FA，避免额外 prefix/suffix merge；
+- 更长但不超过 32K：当前 chunk 做 causal FA，镜像历史做 non-causal FA，
+  再做一次 LSE merge；
+- 超出 32K、状态不连续或不满足单请求条件：回退 gather + FA + merge。
+
+## Decode attention
+
+### 1. 为什么 2D grid 不够
+
+decode 只有一个 query token。2D paged attention 的主要 grid 约为：
+
+```text
+num_sequences x num_kv_heads = num_sequences x 4
+```
+
+长上下文时，每个 program 要扫描很长的 KV，4 个 KV heads 提供的并行度不足
+以填满 BW1000。于是 3D kernel 把每个 KV 序列沿 token 维切成多个 segment：
+
+```text
+producer: (query block, KV head, segment)
+  -> partial output, local max, local exp-sum
+reducer:
+  -> merge all segment states into one output
+```
+
+分段 softmax 不是简单平均。对每个 segment 的局部状态 `(O_i, m_i, l_i)`，
+先取全局 `m=max_i(m_i)`，再按 `exp(m_i-m)` 重标定 `l_i` 和 `O_i`，最后得到
+全局 output。这与在线 softmax 等价，只改变了合法的归约分工。
+
+### 2. 为什么最终是 `BM16/T16/S256`
+
+联合扫描了 `BLOCK_M=8/16/32/64`、`TILE_SIZE=8/16/32` 和
+`segments=32/64/128/256`，并把 producer 与 reducer 一起放进 HIP Graph
+测量。最终配置为：
+
+```text
+TRITON_UNIFIED_ATTN_3D_BLOCK_M=16
+TRITON_UNIFIED_ATTN_3D_TILE_SIZE=16
+VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS=256
+```
+
+选择理由：
+
+- **BM64 的 accumulator 浪费**：GQA6 decode 只有 6 个有效 query-head 行，
+  `[64, 256]` FP32 accumulator 绝大部分无效，寄存器压力直接限制 occupancy；
+- **BM8 的 q-block 浪费**：`BLOCK_Q=8//6=1`，通用上界 grid 会产生额外 q-block，
+  甚至启动一个随后立即返回的 program；
+- **TILE16 的资源平衡**：TILE32 增加 LDS 和 softmax 工作集，没有抵消减少的
+  loop 次数；
+- **S256 的并行度**：4 个 KV heads 乘 256 个 segment 提供足够 producer，
+  但不会像更大 segment 数那样让 reducer 和 workspace 成为主要开销。
+
+256 段的 output/max/expsum workspace 约 193.5 MiB，是有意用显存换长上下文
+并行度。该 workspace 会在 backend 初始化时建立，3D producer 和 reducer 一起
+捕获，避免每 token 产生额外 launch。
+
+![Decode attention 的 3D 分段和 BM16 对比](docs/assets/contest-optimization/decode-attention-3d.png)
+
+目标机相对 BM64/T16/S256 的 kernel 用时：
+
+| context | BM64 | BM16 | 用时降低 |
+| ---: | ---: | ---: | ---: |
+| 4K | 0.133 ms | 0.066 ms | 50.56% |
+| 8K | 0.173 ms | 0.091 ms | 47.23% |
+| 16K | 0.245 ms | 0.138 ms | 43.46% |
+| 24K | 0.314 ms | 0.180 ms | 42.69% |
+| 32K | 0.393 ms | 0.234 ms | 40.39% |
+
+## Decode GEMV 与 MLP
+
+### 1. Strided-K 的带宽原理
+
+decode Linear 是 `N=1` 的矩阵向量乘：
+
+```text
+[1, K] x [K, M] -> [1, M]
+```
+
+每个输出 token 都要流过大部分权重，算术强度低，关键不是增加 FLOPs，而是让
+每个 wave 发出连续、合并、足够多的 HBM 请求。
+
+Strided-K kernel 让线程沿 K 维读取固定大小的连续 16-byte chunk，再用
+grid-stride 遍历 reduction：
+
+```text
+BF16: 16 bytes = 8 elements
+K=5120: 5120 / 8 = 640 chunks
+640 threads = 10 wave64
+```
+
+这比通用 LLMM1 的线程数随 K 增长更适合 Qwen3.5 的固定形状，也可以处理
+`K=17408` 的 down projection，而 LLMM1 的 launch thread count 会超过其
+适用边界。`rows_per_block` 决定一个 block 同时负责多少输出行：大 M 需要
+更多并行输出，长 K 或特殊 down projection 则收窄 rows，避免权重读取和
+寄存器活跃值相互竞争。
+
+![Decode Strided-K GEMV 的实测表](docs/assets/contest-optimization/decode-strided-k-gemv.png)
+
+目标 shape 的代表数据：
+
+| `(M,K)` | rocBLAS | Strided-K | 相对 rocBLAS |
+| ---: | ---: | ---: | ---: |
+| `(16384,5120)` | 239.714 us | 116.867 us | -51.25% |
+| `(34816,5120)` | 499.329 us | 246.080 us | -50.72% |
+| `(8192,5120)` | 69.509 us | 59.399 us | -14.55% |
+| `(248320,5120)` | 1.905 ms | 1.754 ms | -7.93% |
+| `(5120,17408)` | 150.309 us | 151.280 us* | +0.65% |
+
+`*` down projection 的 151.280 us 是 rows=8 参考实现；最终源码对精确
+`[5120,17408]` 使用 rows=1/1024-thread specialization，而不是把 rows=8
+的微基准误写成最终收益。
+
+### 2. BF16 输入、FP32 reduction
+
+gfx936 路径没有可直接复用的 packed BF16 dot/FMA。若模拟 `__hfma2`，每两个
+乘积后就会舍入一次，并增加 unpack/pack 指令。Strided-K 将 BF16 pair 转为
+FP32，逐项 `fmaf` 累加，最后按接口写回 BF16。
+
+这同时改善性能和长 reduction 的数值稳定性：在 `[16384,5120]` 上，Strided-K
+相对 rocBLAS 的 rel-L2 为 `1.88e-5`，旧 LLMM1 为 `3.47e-3`；在
+`[8192,5120]` 上分别为 `3.05e-6` 和 `3.45e-3`。GEMV 的正确性因此以
+FP32 reference、BF16 容差和固定 workload accuracy 共同判断，不能只看速度。
+
+### 3. shape gate 与专用 rows
+
+`rocm_unquantized_gemm_impl` 只在以下条件同时满足时进入 Strided-K：
+
+- ROCm gfx9 skinny-GEMM 路径已启用；Qwen3.5 专用 rows 与 LM-head 例外还
+  需要 gfx936 BF16；
+- BF16/FP16、无 bias、`N=1`、连续 tensor、`K % 8 == 0`；
+- M/K 命中已测 shape 或可证明的 rows 规则。
+
+不命中时依次回退 LLMM1 或通用 `torch.nn.functional.linear`。提交中的专用
+shape 包括：
+
+| shape | 路由 | 原理 |
+| --- | --- | --- |
+| `K=5120` 大投影 | 640 threads | 每线程一个 16-byte chunk，10 个 wave64 |
+| `[5120,17408]` down | rows=1、1024 threads | 一个 block 负责一个输出行，增加独立 HBM 请求 |
+| `[248320,5120]` LM head | rows=2 | 只放开目标大词表，避免泛化到其他词表 |
+
+### 4. 融合 gate_up GEMV 与 SwiGLU
+
+普通路径先生成完整 `gate_up`：
+
+```text
+[1,5120] x [5120,34816] -> [1,34816]
+split -> gate, up -> silu(gate) * up
+```
+
+对于 Qwen3.5 decode 的精确 shape，`LLMM_SiluMul` 在读取 gate/up 的同时完成
+激活和乘法，直接产生 `[1,17408]`：
+
+```text
+weight read -> FP32/activation -> output
+```
+
+它删除了 `[1,34816]` 中间量、一次 global write/read 和一次 kernel launch。
+只有 TP=1、BF16、无量化/LoRA、连续布局、`N=1` 时命中；其他情况保留原
+MLP 路径。目标 shape 用时从 261.489 us 降至 247.957 us，降低 5.17%，
+输出逐 bit 一致。
+
+## Prefill MLP
+
+4096-token prefill 的矩阵已经足够大，适合固定 rocBLAS solution，而不适合
+沿用 decode GEMV：
+
+```text
+down:    [4096,17408] x [17408,5120]
+gate_up: [4096,5120]   x [5120,34816]
+```
+
+代码在 gfx936、BF16、无 bias、连续 tensor 且精确 shape 时调用：
+
+- down：rocBLAS solution `20980`；
+- gate_up：rocBLAS solution `20981`。
+
+这不是“任意 GEMM 都使用固定编号”，而是把独立 profile 验证过的 solution
+绑定到唯一 shape；不满足 gate 仍使用原 GEMM。目标机结果：
+
+| 算子 | 优化前 | 优化后 | 用时降低 |
+| --- | ---: | ---: | ---: |
+| down / solution 20980 | 2.460 ms | 2.374 ms | 3.51% |
+| gate_up / solution 20981 | 4.375 ms | 4.086 ms | 6.60% |
+
+两项与默认实现逐 bit 一致。风险是 solution 与 gfx936、ROCm/rocBLAS 版本和
+矩阵 shape 强绑定，版本变化后必须重新 profile，不能静默沿用。
+
+![Prefill MLP 与 GDN 路由数据](docs/assets/contest-optimization/prefill-mlp-gdn.png)
+
+## GDN prefill
+
+### 1. 按真实 workload bucket 路由 Triton 配置
+
+GDN chunk pipeline 的主要阶段为：
+
+```text
+chunk_gated_delta_rule
+  -> recompute_w_u
   -> chunk_gated_delta_rule_fwd_h
   -> chunk_fwd_o
 ```
 
-1. **按真实 shape/NT bucket 选择 Triton 配置。**
-   对 gfx936、`BT=64`、目标 K/V 维度，根据 head 数和 chunk 数选择 `BK/BV`、warps 和 stages；
-   Qwen3.5 主 shape 为 `(H,K,V,BT)=(48,128,128,64)`。这避免短序列 warmup 与 16K～32K
-   正式负载共享不合适的 autotune 结果，同时保留其他平台和 shape 的原始 autotune 回退。
-   T=4K～32K 上，固定配置相对原始 autotune 的用时降低范围为：recompute **5.1%～6.9%**、
-   state-update h **30.8%～33.3%**、output o **16.3%～19.8%**，各组输出一致。
+Qwen3.5 主 shape 为 `H=48、K=128、V=128、BT=64`。源码在 gfx936 上根据
+`H/K/V/BT/NT` 选择 `BK/BV/warps/stages`；`NT=ceil(T/BT)` 是 chunk 数。
+例如长上下文 bucket 需要更高的并行度，而短 T 的 autotune 结果不应污染
+16K-32K 正式 workload。非 gfx936 或不匹配 shape 继续走原 autotune。
 
-2. **输出直接写最终地址 与 chunk metadata 复用。**
-   普通 non-spec prefill 将 model runner 已分配的 `core_attn_out` 传入 `chunk_fwd_o`，直接写最终
-   地址，消除临时 output tensor 和一次 device-to-device copy；同一轮 GDN pipeline 只生成一次
-   chunk indices，再交给 cumsum、recompute 和 chunk kernel 复用。4K 完整 pipeline 从临时
-   output+copy 的 **1.709 ms** 降到直写的 **1.628 ms**，用时降低 **4.71%**。显式复用 indices
-   与各 stage 经缓存取得 indices 分别为 **1.628/1.629 ms**；前者消除了 6 次
-   `prepare_chunk_indices` 入口调用。
+48 层重复执行意味着这里不能只看一个 kernel 的绝对耗时：
 
-### 微基准测试结果
+| T | recompute | state h | output o |
+| ---: | ---: | ---: | ---: |
+| 4K | -5.15% | -33.30% | -19.56% |
+| 8K | -6.91% | -32.50% | -19.83% |
+| 16K | -5.83% | -31.67% | -16.78% |
+| 32K | -5.87% | -30.77% | -16.31% |
 
-#### Attention
+### 2. output 直写、indices 复用和冷启动预热
 
-| 项目 | 工作负载 | 基线 median | 优化后 median | 用时降低 |
-|---|---|---:|---:|---:|
-| BLOCK_M | q_len=4096，context=4K，BM32→64 | 7.462 ms | 4.734 ms | 36.56% |
-| BLOCK_M | q_len=4096，context=16K，BM32→64 | 48.890 ms | 30.440 ms | 37.74% |
-| BLOCK_M | q_len=4096，context=32K，BM32→64 | 103.748 ms | 64.627 ms | 37.71% |
-| 3D联合配置 | decode 4K，BM64/T16/S256→BM16/T16/S256 | 0.133283 ms | 0.065901 ms | 50.56% |
-| 3D联合配置 | decode 8K，BM64/T16/S256→BM16/T16/S256 | 0.172849 ms | 0.091210 ms | 47.23% |
-| 3D联合配置 | decode 16K，BM64/T16/S256→BM16/T16/S256 | 0.244552 ms | 0.138272 ms | 43.46% |
-| 3D联合配置 | decode 24K，BM64/T16/S256→BM16/T16/S256 | 0.314414 ms | 0.180203 ms | 42.69% |
-| 3D联合配置 | decode 32K，BM64/T16/S256→BM16/T16/S256 | 0.393116 ms | 0.234344 ms | 40.39% |
+普通 non-spec prefill 把 model runner 已经分配的 `core_attn_out` 直接传给
+`chunk_fwd_o`，消除临时 output tensor 和一次 D2D copy。同一轮 pipeline 只
+生成一次 chunk indices，交给 cumsum、recompute、state update 和 output
+阶段复用，减少 metadata 入口调用。
 
-| History | paged UA | gather | suffix+prefix FA | LSE merge | gather+FA+merge | 用时降低 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0 | 4.726 ms | 0 | 1.650 ms | 0 | 1.650 ms | 65.08% |
-| 4K | 13.294 ms | 0.412 ms | 4.561 ms | 0.333 ms | 5.301 ms | 60.12% |
-| 8K | 21.897 ms | 0.814 ms | 7.227 ms | 0.332 ms | 8.365 ms | 61.80% |
-| 16K | 38.997 ms | 1.614 ms | 12.533 ms | 0.332 ms | 14.464 ms | 62.91% |
-| 24K | 56.095 ms | 2.412 ms | 17.822 ms | 0.332 ms | 20.561 ms | 63.35% |
-| 32K | 73.210 ms | 3.210 ms | 23.148 ms | 0.332 ms | 26.664 ms | 63.58% |
+V1 profile 阶段还会预热 `T=16/32/64` 的 BT 配置，并用 profile buffer 的
+`NT` 代表正式长 workload，在 KV cache 分配前完成 JIT/autotune。这样首次
+正式请求不再承担编译和调参的长尾，避免首请求 SLA 熔断；预热失败仍记录
+warning 并让原路径处理实际请求。
 
-| Seq | 通用 gather 路径 | KV mirror | 用时降低 | mirror 路由 |
-|---:|---:|---:|---:|---|
-| 8K | 5.302 ms | 4.477 ms | 15.57% | full-KV causal FA |
-| 16K | 11.412 ms | 9.956 ms | 12.76% | full-KV causal FA |
-| 24K | 17.500 ms | 15.598 ms | 10.87% | full-KV causal FA |
-| 30K | 22.081 ms | 20.397 ms | 7.63% | full-KV causal FA |
-| 31K | 22.843 ms | 20.237 ms | 11.41% | split FA + merge |
-| 32K | 23.601 ms | 20.900 ms | 11.45% | split FA + merge |
+### 3. GDN 的收益边界
 
-#### GEMV 与 MLP
+GDN 是 recurrent/linear attention，不应套用 full-attention 的 page 或 FA
+假设。这里优化的是 chunk index、state update 和 output 的数据流，以及
+gfx936 上固定 workload 的 Triton 编译配置；状态更新数学和最终输出语义不变。
 
-| `(M,K)` | rocBLAS | LLMM1 | Strided-K | Strided-K GB/s | 相对 rocBLAS |
-|---|---:|---:|---:|---:|---:|
-| (16384,5120) | 239.714 µs | 171.886 µs | 116.867 µs | 1435.95 | -51.25% |
-| (96,5120) | 25.748 µs | 11.076 µs | 10.985 µs | 90.44 | -57.34% |
-| (8192,5120) | 69.509 µs | 91.890 µs | 59.399 µs | 1412.69 | -14.55% |
-| (5120,6144) | 50.162 µs | 69.106 µs | 50.399 µs | 1248.77 | +0.47% |
-| (34816,5120) | 499.329 µs | 348.952 µs | 246.080 µs | 1449.11 | -50.72% |
-| (5120,17408) | 150.309 µs | — | 151.280 µs（rows=8参考） | 1178.63 | +0.65% |
-| (248320,5120) | 1.905 ms | 2.403 ms | 1.754 ms | 1450.20 | -7.93% |
+## 统一优化方法
 
-| 项目 | 基线 | 优化后 | 结果 |
-|---|---:|---:|---|
-| 640 threads，M=16384 | 142.245 µs | 128.453 µs | -9.70%，bitwise |
-| 640 threads，M=34816 | 299.552 µs | 270.662 µs | -9.64%，bitwise |
-| 640 threads，M=248320 | 2.103 ms | 1.910 ms | -9.19%，bitwise |
-| gate_up+SwiGLU 融合 | 261.489 µs | 247.957 µs | -5.17%，bitwise |
-| rocBLAS solution 20980 | 2.460 ms / 296.8 TFLOPS | 2.374 ms / 307.6 TFLOPS | -3.51%，bitwise |
-| rocBLAS solution 20981 | 4.375 ms / 333.8 TFLOPS | 4.086 ms / 357.4 TFLOPS | -6.60%，bitwise |
+### Tune：先看真实 backend，再改参数
 
-#### GDN
+每个参数都必须回答三个问题：
 
-| T | recompute autotune→fixed | h autotune→fixed | o autotune→fixed |
-|---:|---:|---:|---:|
-| 4K | 0.278→0.263 ms（-5.15%） | 0.965→0.644 ms（-33.30%） | 0.438→0.352 ms（-19.56%） |
-| 8K | 0.601→0.559 ms（-6.91%） | 1.909→1.288 ms（-32.50%） | 1.067→0.855 ms（-19.83%） |
-| 16K | 1.245→1.173 ms（-5.83%） | 3.795→2.593 ms（-31.67%） | 2.194→1.826 ms（-16.78%） |
-| 32K | 2.473→2.328 ms（-5.87%） | 7.570→5.241 ms（-30.77%） | 4.401→3.683 ms（-16.31%） |
+1. 实际服务命中了哪个 backend 和 kernel，而不是代码中“理论上可用”的路径？
+2. 真实 shape、dtype、序列长度和并发是多少？
+3. 变快来自减少 work、提高 occupancy、改善 HBM 访问，还是只是微基准缓存
+   状态更热？
 
+因此我们先建立干净 baseline，抓短服务期 profile，再做单项 microbench 和
+官方脚本 A/B。PPT 中 BM64、TILE16、BM16/T16/S256、640 threads 和 GDN
+bucket 都来自这种流程。
 
+### Route：打开被 gate 掉的已有快路径
 
-## 优化点汇总表
+很多通用路径不是没有实现，而是被平台白名单、shape 检查或语义扩展挡住：
 
-| 阶段 | 优化点 / 提交 | 目标与生效条件 | 关键代码路径 | 软硬件依据 | 性能数据 |
-|---|---|---|---|---|---|
-| Full-attention | 2D `BLOCK_M=64`（`9097a14`、`d56a55b`） | Unified Attention 长 prefill；GQA ratio≤16 | `_get_block_m -> UA2D` | 减少长 query 的 q-block program，换取寄存器压力 | q_len=4096、4K～32K：BM32→64 用时降低 36.6%～37.7%；不再作用于3D decode |
-| Full-attention | prefill `TILE_SIZE=16`（`0a27664`） | 非 Gemma、纯 Triton prefill | `_get_tile_size -> UA2D` | 降低 head_dim=256 的 LDS 压力 | 约 2.6～2.8× kernel 加速 |
-| Decode attention | 3D `BM16/T16/S256`（`d10bbd2`、`d0b1ce1`及联合调优） | BF16、小 batch、长 context decode | `_get_3d_block_m -> UA3D -> reduce_segments` | 以 segment 维扩展并行度，同时减少无效 accumulator 行和寄存器压力 | 相对 BM64/T16/S256，4K～32K kernel 用时降低 40.39%～50.56%；16K 预计贡献约3.6% TPOT；workspace 193.5 MiB |
-| Full-attention | 连续 FlashAttention prefill（`0ff997e`） | ROCm BF16/FP16、普通 causal full attention | `_forward_fa_prefill -> FA -> LSE merge` | 避开 paged 寻址与有数值问题的 paged FA | history 0～32K 相对 paged UA 用时降低 60.1%～65.1% |
-| Full-attention | 32K KV mirror + 30K hybrid route（`f958b91`） | 单请求、24Q/4KV/head=256 | `_forward_fa_prefill_mirror` | 用约 2 GiB 镜像换重复 gather | 8K～32K 用时降低 7.6%～15.6%；128 MiB/层 |
-| Decode GEMV | 通用 Strided-K + shape rows（`87eae58`、`9b1adfa`、`ee1e066`） | BF16/FP16、N=1、无 bias、K%8=0 | `rocm_unquantized_gemm -> LLMM_StridedK` | 合并 16-byte 读取，固定线程 grid-stride K | 七组目标 shape 相对 rocBLAS 为 -57.3%～+0.7%；最高 1450 GB/s |
-| Decode GEMV | BF16 FP32 `fmaf` 累加（`2f151cc`） | gfx936 BF16 reduction | `LLGemmStridedK_kernel` | 避免 packed BF16 模拟和逐 pair 舍入 | [16384,5120] rel-L2 1.88e-5，LLMM1 为 3.47e-3 |
-| Decode GEMV | K=5120 使用 640 threads（`be6637e`） | K=5120 的目标投影 | `LLMM_StridedK` launch | 640 个 16-byte chunk 对应 10 个 wave64 | 约 +9%～10% |
-| Decode MLP | gate_up GEMV + SwiGLU 融合（`13639b4`） | TP=1、BF16、无量化/LoRA、[34816,5120] | `Qwen3_5MLP -> LLMM_SiluMul` | 消除完整 gate_up 中间量和 activation launch | 261.489→247.957 µs，用时降低 5.17%，bitwise |
-| Decode GEMV | down rows=1/1024 threads（`4d411c5`） | BF16 [5120,17408] | `LLGemmStridedKRows1Down_kernel` | 增加独立 HBM 请求、不复制权重读取 | rows=8 参考 151.280 µs，rocBLAS 150.309 µs；rows=1 为精确 shape 路由 |
-| Decode GEMV | LM head rows=2（`eb40282`） | gfx936 BF16 [248320,5120] | `_use_strided_gemv -> LLMM_StridedK` | 仅放开目标大词表 shape | 1.905→1.754 ms，用时降低 7.93%；相对 LLMM1 用时降低 27.03% |
-| Prefill MLP | down solution 20980（`da496ba`） | BF16 [4096,17408]×[17408,5120] | `rocblas_bf16_mlp_down_4096` | 使用目标 shape 的 rocBLAS 已选优实现 | 2.460→2.374 ms，用时降低 3.51%，bitwise |
-| Prefill MLP | gate_up solution 20981（`3a2d060`） | BF16 [4096,5120]×[5120,34816] | `rocblas_bf16_mlp_gate_up_4096` | 使用目标 shape 的 rocBLAS 已选优实现 | 4.375→4.086 ms，用时降低 6.60%，bitwise |
-| GDN prefill | gfx936 shape/NT 配置（`97869b0`、`8bf1196`） | BT=64、K/V=128/256、目标 NT bucket | `recompute_w_u/chunk_fwd_h/chunk_fwd_o` | 48 层重复热点；避免短序列 autotune 配置污染 | recompute/h/o 分别用时降低 5.1%～6.9%/30.8%～33.3%/16.3%～19.8% |
-| GDN prefill | output 直写 + chunk indices 复用（`97869b0`、`8bf1196`） | 普通 non-spec prefill | `Qwen3NextGatedDeltaNet -> chunk pipeline` | 减少临时分配、D2D copy 和 metadata 入口 | 1.709→1.628 ms，用时降低 4.71%；消除 6 次 indices 入口调用 |
-| GDN 冷启动 | 长上下文 specialization 预热（`f916d70`、`442994b`） | V1 profile、gfx936 命中配置 bucket | `_warmup_prefill_kernels` | 在 KV cache 分配前完成 JIT/autotune | 首请求 45.478→0.008 s；预热 200.385 s；reserved 662→442 MiB |
+- gfx936 进入 `_rocm_C`/skinny GEMM 构建，才能交付自定义 Strided-K；
+- 普通 full-attention prefill 走连续 FA，decode 仍走 paged Triton UA；
+- 4096-token MLP 走独立 rocBLAS solution；
+- GDN 在真实 `NT` bucket 走固定配置，而不是短 warmup 的通用 autotune。
 
-## 时间线（workspace分支）
+### Fuse/Remove：减少内存往返和 launch
 
-### 2026-06-20～24：建立比赛工程和证据闭环
+融合和删除操作的共同目标是减少不可避免的 global traffic：
 
-从 SourceFind/OpenDAS v0.18.1 建立 baseline，明确只认可 DCU 实机结果；完善服务期 profile、
-wheel 来源、三档吞吐、SLA、accuracy 和合规检查流程。`9097a14` 开始尝试 BM64，使优化从通用
-猜测转向真实 backend、shape 和得分贡献。
+- `gate_up + SwiGLU` 删除中间 gate_up tensor；
+- GDN output 直写删除 D2D copy；
+- chunk indices 复用删除重复 metadata 准备；
+- KV mirror 删除历史 KV 的重复 gather。
 
-### 2026-06-30～07-06：打通 ROCm 自定义算子并转向带宽优化
+### 为什么不从零手写通用 kernel
 
-`f93a2de`、`ab94c4b` 让 gfx936 命中 skinny GEMM 并恢复 `_rocm_C` 构建。早期强制 LLMM1
-处理 down projection 的 `f7a8de6` 收益或适用性不足，由 `61ab7c8` 完整回退；随后改用可覆盖
-大 K 的 Strided-K，并开始调优 3D decode segments 和 Unified Attention tile。
+Triton 已能在 gfx936 上生成 MMA/MFMA 路径，且 vLLM 已包含大量通用优化。
+从零重写通用 attention/GEMM 的代价是：需要重新处理分页、mask、softmax、
+多 dtype、不同模型和回退路径，NVIDIA 的 warp 假设也不能直接迁移到 wave64。
+因此提交只增加精确 shape 的窄实现，并保留原始路径作为 fallback。
 
-### 2026-07-07～10：形成 FA prefill 与 Strided-K 主线
+## 结果与证据
 
-`0ff997e` 将满足约束的 full-attention prefill 路由到连续 FlashAttention，保留 decode 的
-Triton paged 路径。`87eae58`、`9b1adfa`、`ee1e066` 逐步完善 Strided-K 和 shape fallback，
-`2f151cc` 用 FP32 累加同时修复 gfx936 BF16 精度与性能问题。
+### 单项 microbench
 
-### 2026-07-11～12：融合、专用 shape 与连续 KV 镜像
+| 类别 | 代表结果 | 解释 |
+| --- | --- | --- |
+| UA 2D BM32 -> BM64 | 4K/16K/32K query context 用时降低 36.6%-37.7% | 纯 Triton 长 prefill fallback |
+| UA prefill TILE16 | kernel 约 2.6-2.8x | 降 LDS、提高 wave residency |
+| 连续 FA vs paged UA | history 0-32K 降低 60.1%-65.1% | 主要消除 paged 地址和 gather 代价 |
+| KV mirror | 8K-32K 降低 7.6%-15.6% | 以约 2 GiB 镜像换重复 gather |
+| 3D decode BM16/T16/S256 | kernel 降低 40.39%-50.56% | segment 并行度 + 小 accumulator |
+| Strided-K | 目标 shape 相对 rocBLAS 最高降低 57.34% | 带宽型 N=1 GEMV |
+| gate_up + SwiGLU | 261.489 -> 247.957 us | 删除中间量和一次 launch |
+| Prefill MLP | down -3.51%，gate_up -6.60% | 固定 rocBLAS solution |
+| GDN h/output | h 降 30.77%-33.30%，o 降 16.31%-19.83% | 48 层重复热点 |
 
-这一阶段加入 K=5120/640-thread、gate_up+SwiGLU 融合、decode down rows1/1024、LM head rows2，
-并为 4096-token MLP 选择 rocBLAS 20980/20981。`7cee783` 的 fused K/V gather 在 `4490eaf`
-回退，最终由 `f958b91` 的逐层连续 KV 镜像解决 chunked prefill 重复 gather。
+### 端到端解读
 
-### 2026-07-13：优化 48 层 GDN
+单请求评测中，一个请求的近似耗时为：
 
-`97869b0`、`8bf1196` 按 gfx936 的真实 H/K/V/BT/NT 选择 GDN Triton 配置，增加 output 直写和
-chunk indices 复用；`f916d70`、`442994b` 把长上下文 specialization 提前到 profile 阶段编译，
-避免第一个正式请求承担 JIT/autotune 和额外峰值显存。`d56a55b` 删除 wheel 构建期文本注入，改为运行
-时读取 `BLOCK_M`、默认 64。
+```text
+request_time ~= TTFT + (output_tokens - 1) x TPOT
+```
+
+因此 prefill 路径主要影响 TTFT，decode 路径主要影响 TPOT。微基准的收益
+不能简单相加：
+
+- FA prefill 与 Triton UA prefill 是互斥路由；
+- KV mirror 是 FA prefill 的增量优化，不是另一条独立 attention 计算；
+- BM16/T16/S256 只在 decode 生效；
+- Strided-K、fused SwiGLU 和 LM head 只覆盖精确 decode shape；
+- GDN 与 full attention 交错执行，收益还会受到其他层和框架调度影响。
+
+### 正确性与稳定性门槛
+
+候选按风险逐级晋级；进入最终栈的改动需要完成对应层级的证据：
+
+1. same-input 数值对照和 finite 检查；
+2. output length/text 或 bitwise 对照（允许明确记录的 BF16 reduction 容差）；
+3. 三档官方 throughput、TTFT/TPOT SLA 和请求成功率；
+4. 固定 accuracy；
+5. 组合版本的 full x3 重复性和服务清理检查。
+
+曾经出现的负收益、错误数值或无效路径会回滚，不会因为 standalone microbench
+为正就写入最终提交。特别是 GEMV 的 FP32 reduction 和 attention 的 LSE merge
+都必须同时看数值和性能。
+
+## 环境、构建与回退
+
+目标环境需要预装比赛容器指定的 DTK、PyTorch、Triton、AITER、rocBLAS 和
+FlashAttention。不要用公开 PyPI 版本覆盖平台定制包。
+
+### 默认配置
+
+当前提交默认使用以下值；完整说明见
+[`ENVIRONMENT_VARIABLES.md`](ENVIRONMENT_VARIABLES.md)：
+
+```bash
+export TRITON_UNIFIED_ATTN_BLOCK_M=64
+export TRITON_UNIFIED_ATTN_3D_BLOCK_M=16
+export TRITON_UNIFIED_ATTN_3D_TILE_SIZE=16
+export VLLM_PREFILL_ATTN_TILE_SIZE=16
+export VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS=256
+export VLLM_TRITON_FA_PREFILL=1
+export VLLM_TRITON_FA_PREFILL_MIRROR_CAPACITY=32768
+export VLLM_TRITON_FA_PREFILL_FULL_KV_THRESHOLD=30720
+export VLLM_ROCM_STRIDED_GEMV=True
+```
+
+这些变量只选择已验证的默认路径；变量值改变后，必须重新做相同 shape 的
+compile、correctness、A/B 和 full 评测，不能把本 README 的数据直接套用。
+
+### 构建
+
+源码包含 ROCm custom ops，使用完整构建流程：
+
+```bash
+bash build_vllm.sh
+python -m pip install --force-reinstall --no-deps dist/vllm-*.whl
+```
+
+只做 Python 层试验时可以使用项目规定的预编译安装方式；涉及
+`csrc/rocm/skinny_gemms.cu`、bindings 或 CMake 时必须完整编译。
+
+### 回退矩阵
+
+| 条件不满足 | 回退 |
+| --- | --- |
+| FA 不可导入或 attention 语义扩展存在 | Triton Unified Attention |
+| KV mirror 超容量、状态不连续或多请求 | gather + FA + LSE merge 或 Triton UA |
+| decode 不是 `N=1`/shape 不匹配 | LLMM1、rocBLAS 或原 linear |
+| GDN 不在 gfx936 workload bucket | 原 autotune 配置 |
+| 固定 rocBLAS shape 不匹配 | 默认 GEMM |
+
+这种 fail-closed 设计保证优化是可撤回的：关闭变量或不满足 gate 时，模型
+仍使用原始正确路径，而不是产生未定义结果。
+
+## 提交边界
+
+- 不修改模型权重、tokenizer、chat template、测试数据或官方请求流；
+- 不使用 prefix cache、跨样本持久化结果或预生成量化权重；
+- 不改变 scheduler/batch 边界；
+- 所有自定义 kernel 都有精确 shape/dtype/device gate；
+- 微基准用于定位和归因，最终结论以官方脚本、accuracy、SLA 和 full x3 为准；
+- `submit/v3.0` 是独立提交线，`develop/workspace` 的实验不会自动进入提交。
+
+本项目使用 Apache License 2.0 及上游第三方许可。代码中保留原始版权头；
+提交者应在提交 PR 或比赛材料中说明 AI 辅助使用，并由人工审阅每一项代码和
+实验结论。
+
+## 参考代码路径
+
+| 主题 | 代码 |
+| --- | --- |
+| UA 2D/3D block 与 tile | [`vllm/v1/attention/ops/triton_unified_attention.py`](vllm/v1/attention/ops/triton_unified_attention.py) |
+| FA prefill、mirror、LSE merge | [`vllm/v1/attention/backends/triton_attn.py`](vllm/v1/attention/backends/triton_attn.py) |
+| Strided-K、rows、SwiGLU、rocBLAS solution | [`vllm/model_executor/layers/utils.py`](vllm/model_executor/layers/utils.py)、[`csrc/rocm/skinny_gemms.cu`](csrc/rocm/skinny_gemms.cu) |
+| Qwen3.5 MLP gate | [`vllm/model_executor/models/qwen3_5.py`](vllm/model_executor/models/qwen3_5.py) |
+| GDN workload bucket 与 warmup | [`vllm/model_executor/layers/fla/ops/utils.py`](vllm/model_executor/layers/fla/ops/utils.py)、[`vllm/model_executor/models/qwen3_next.py`](vllm/model_executor/models/qwen3_next.py) |
+| 环境变量 | [`ENVIRONMENT_VARIABLES.md`](ENVIRONMENT_VARIABLES.md) |
+
+## 开发时间线
+
+| 阶段 | 关键变化 |
+| --- | --- |
+| Baseline | 导入 SourceFind/OpenDAS v0.18.1，建立三档吞吐、SLA、accuracy 和 profile 闭环 |
+| v1-v2 | gfx936 skinny GEMM、Strided-K、FP32 reduction、3D segments、FA prefill |
+| v2.7-v2.9 | 连续 KV mirror、LM head/down/GDN/Prefill MLP 专用 shape |
+| v3.0 | GDN 长上下文预热、独立 BM16/T16/S256 decode 配置和 README 证据整理 |
+
+最终经验可以概括为：先用 profile 找到真实瓶颈，再按硬件和模型 shape 做
+窄门控优化；每一次速度提升都必须伴随正确性、SLA、显存和可回退性证据。
